@@ -1,0 +1,16 @@
+server:
+  port: ${SERVER_PORT:8080}
+
+spring:
+  application:
+    name: dataease-migration
+  mvc:
+    async:
+      request-timeout: 0
+
+migration:
+  ssh:
+    connect-timeout-millis: 30000
+    command-timeout-millis: 3600000
+  mysql-tools:
+    directory: ${MIGRATION_MYSQL_TOOLS_DIRECTORY:tools/mysql}

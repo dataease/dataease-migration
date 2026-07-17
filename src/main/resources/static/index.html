@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DataEase 数据迁移</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <main>
+    <h1>DataEase 2.0 → 3.0 数据迁移</h1>
+    <p class="warning">执行后会删除并重建 DataEase 3.0 的目标数据库。请先确认目标库可被覆盖。</p>
+    <form id="migration-form">
+      <section>
+        <h2>DataEase 2.0（源端）</h2>
+        <div class="grid">
+          <label>服务器 IP / 主机名<input name="sourceServer.host" required></label>
+          <label>SSH 端口<input name="sourceServer.port" type="number" min="1" max="65535" value="22" required></label>
+          <label>服务器用户名<input name="sourceServer.username" value="root" required></label>
+          <label>服务器密码<input name="sourceServer.password" type="password" required autocomplete="new-password"></label>
+          <label>数据库 JDBC URL<input name="sourceDatabase.jdbcUrl" placeholder="jdbc:mysql://127.0.0.1:3306/dataease" required></label>
+          <label>数据库用户<input name="sourceDatabase.username" value="root" required></label>
+          <label>数据库密码<input name="sourceDatabase.password" type="password" required autocomplete="new-password"></label>
+          <label class="wide">DataEase 安装目录<input name="sourceServer.installPath" value="/opt/dataease2.0" required></label>
+        </div>
+      </section>
+      <section>
+        <h2>DataEase 3.0（目标端）</h2>
+        <div class="grid">
+          <label>服务器 IP / 主机名<input name="targetServer.host" required></label>
+          <label>SSH 端口<input name="targetServer.port" type="number" min="1" max="65535" value="22" required></label>
+          <label>服务器用户名<input name="targetServer.username" value="root" required></label>
+          <label>服务器密码<input name="targetServer.password" type="password" required autocomplete="new-password"></label>
+          <label>数据库 JDBC URL<input name="targetDatabase.jdbcUrl" placeholder="jdbc:mysql://127.0.0.1:3306/dataease" required></label>
+          <label>数据库用户<input name="targetDatabase.username" value="root" required></label>
+          <label>数据库密码<input name="targetDatabase.password" type="password" required autocomplete="new-password"></label>
+          <label class="wide">DataEase 安装目录<input name="targetServer.installPath" value="/opt/dataease3.0" required></label>
+        </div>
+      </section>
+      <button id="submit-button" type="submit">执行迁移</button>
+    </form>
+    <section class="logs-section">
+      <h2>操作日志</h2>
+      <pre id="logs" aria-live="polite">等待执行迁移任务。</pre>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>
