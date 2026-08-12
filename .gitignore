@@ -1,0 +1,56 @@
+# Compiled class file
+*.class
+
+# Log file
+*.log
+
+# BlueJ files
+*.ctxt
+
+# Mobile Tools for Java (J2ME)
+.mtj.tmp/
+
+# Package Files #
+*.jar
+*.war
+*.nar
+*.ear
+*.zip
+*.tar.gz
+*.rar
+.idea/
+target/
+tools/
+.vscode/
+.lh/
+*.iml
+hs_err_pid*
+node_modules/
+dist/
+package-lock.json
+.DS_Store
+.stylelintcache
+core/core-frontend/release/
+plugins/vite-test
+core/core-frontend/.stylelintcache
+/core/core-backend/src/main/resources/static/
+/core/core-backend/src/test
+/core/core-frontend/node/
+/core/core-frontend/lib/
+/core/core-frontend/components.d.ts
+core/core-frontend/src/assets/fsSvg.js
+core/core-frontend/src/assets/fsSvg.html
+.flattened-pom.xml
+/core/core-backend/
+/core/frontend/
+/core/mobile/
+/sdk/dataease-plugin-common/
+/sdk/dataease-plugin-datasource/
+/sdk/dataease-plugin-filter/
+/sdk/dataease-plugin-interface/
+/sdk/dataease-plugin-view/
+/extensions/
+.vite/
+/core/backend/
+/classpath:substitule.json
+/core/core-frontend/.claude/settings.json

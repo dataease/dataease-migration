@@ -20,15 +20,18 @@ public class MigrationService {
 
     private final SshCommandExecutor ssh;
     private final DatabaseMigrationSelector databaseMigrator;
+    private final TargetDatabaseUpgradeService targetDatabaseUpgradeService;
     private final PluginMigrationService pluginMigrationService;
     private final Executor migrationExecutor;
     private final Map<String, MigrationJob> jobs = new ConcurrentHashMap<>();
 
     public MigrationService(SshCommandExecutor ssh, DatabaseMigrationSelector databaseMigrator,
+                            TargetDatabaseUpgradeService targetDatabaseUpgradeService,
                             PluginMigrationService pluginMigrationService,
                             @Qualifier("migrationExecutor") Executor migrationExecutor) {
         this.ssh = ssh;
         this.databaseMigrator = databaseMigrator;
+        this.targetDatabaseUpgradeService = targetDatabaseUpgradeService;
         this.pluginMigrationService = pluginMigrationService;
         this.migrationExecutor = migrationExecutor;
     }
@@ -61,6 +64,7 @@ public class MigrationService {
 
             migrateFiles(request.sourceServer(), request.targetServer(), remoteFiles, localFiles, job);
             migrateDatabase(request, job);
+            targetDatabaseUpgradeService.execute(request.targetDatabase(), job);
             pluginMigrationService.updatePlugins(request.targetDatabase(), job);
             job.log("迁移完成。");
         } catch (Exception e) {
