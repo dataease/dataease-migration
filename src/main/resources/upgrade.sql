@@ -181,6 +181,6 @@ SET @de_upgrade_timestamp = NULL;
 SET @de_upgrade_sequence = NULL;
 
 
-INSERT INTO `de_standalone_version` (`installed_rank`, `version`, `description`, `type`, `script`, `checksum`, `installed_by`, `installed_on`, `execution_time`, `success`) VALUES ('45', '1.40', 'ddl', 'SQL', 'V1.40__ddl.sql', '0', 'system', '2026-07-08 13:28:37', '47165', '1');
-INSERT INTO `de_standalone_version` (`installed_rank`, `version`, `description`, `type`, `script`, `checksum`, `installed_by`, `installed_on`, `execution_time`, `success`) VALUES ('46', '2.40', 'ddl', 'SQL', 'V2.40__ddl.sql', '0', 'system', '2026-07-08 13:29:24', '3401', '1');
-INSERT INTO `de_standalone_version` (`installed_rank`, `version`, `description`, `type`, `script`, `checksum`, `installed_by`, `installed_on`, `execution_time`, `success`) VALUES ('47', '3.40', 'ddl', 'SQL', 'V3.40__ddl.sql', '0', 'system', '2026-07-08 13:29:27', '178', '1');
+INSERT INTO `de_standalone_version` (`installed_rank`, `version`, `description`, `type`, `script`, `checksum`, `installed_by`, `installed_on`, `execution_time`, `success`) VALUES ('100', '1.40', 'ddl', 'SQL', 'V1.40__ddl.sql', '0', 'system', '2026-07-08 13:28:37', '47165', '1');
+INSERT INTO `de_standalone_version` (`installed_rank`, `version`, `description`, `type`, `script`, `checksum`, `installed_by`, `installed_on`, `execution_time`, `success`) VALUES ('101', '2.40', 'ddl', 'SQL', 'V2.40__ddl.sql', '0', 'system', '2026-07-08 13:29:24', '3401', '1');
+INSERT INTO `de_standalone_version` (`installed_rank`, `version`, `description`, `type`, `script`, `checksum`, `installed_by`, `installed_on`, `execution_time`, `success`) VALUES ('102', '3.40', 'ddl', 'SQL', 'V3.40__ddl.sql', '0', 'system', '2026-07-08 13:29:27', '178', '1');
