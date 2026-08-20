@@ -16,7 +16,7 @@ import java.util.concurrent.Executor;
 @Service
 public class MigrationService {
     private static final String FILE_ARCHIVE_PREFIX = "/tmp/dataease-files-";
-    private static final String[] DATA_DIRECTORIES = {"i18n", "font", "exportData", "map", "geo", "appearance"};
+    private static final String[] DATA_DIRECTORIES = {"i18n", "font", "exportData", "map", "geo", "appearance", "static-resource"};
 
     private final SshCommandExecutor ssh;
     private final DatabaseMigrationSelector databaseMigrator;
@@ -79,7 +79,7 @@ public class MigrationService {
 
     private void migrateFiles(ServerInfo source, ServerInfo target, String remoteArchive, Path localArchive,
                               MigrationJob job) throws Exception {
-        job.log("开始迁移文件：i18n、font、exportData、map、geo、appearance 及插件。");
+        job.log("开始迁移文件：i18n、font、exportData、map、geo、appearance static-resource 及插件。");
         String sourceDataDirectory = source.installPath() + "/data";
         String directories = String.join(" ", DATA_DIRECTORIES);
         ssh.execute(source, "tar -C " + ShellEscaper.quote(sourceDataDirectory) + " -czf "

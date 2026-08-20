@@ -18,7 +18,7 @@ public class TargetDatabaseUpgradeService {
     private static final String UPGRADE_SCRIPT = "upgrade.sql";
     private static final String CROSS_DATASET_QUERY = """
             SELECT 1
-            FROM dataeasev3jinlong.core_dataset_group
+            FROM core_dataset_group
             WHERE is_cross IS TRUE
             LIMIT 1
             """;

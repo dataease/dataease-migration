@@ -4,7 +4,7 @@
 
 迁移顺序为：
 
-1. 将源端 `data/i18n`、`font`、`exportData`、`map`、`geo`、`appearance` 打包并复制至目标端的 `data` 目录，并将发行包的三个内置插件 JAR 复制至目标端 `data/plugin`。
+1. 将源端 `data/i18n`、`font`、`exportData`、`map`、`geo`、`appearance` `static-resource` 打包并复制至目标端的 `data` 目录，并将发行包的三个内置插件 JAR 复制至目标端 `data/plugin`。
 2. 通过 JAR 内置的 MySQL Connector/J 读取源库的结构、数据、视图、存储过程、函数、触发器及事件。
 3. 删除目标端 JDBC URL 指向的数据库，使用 `utf8mb4` 与 `utf8mb4_0900_ai_ci` 重建，并通过 JDBC 写入迁移内容。
 4. 在目标端数据库执行内置的 `upgrade.sql` 升级脚本。
