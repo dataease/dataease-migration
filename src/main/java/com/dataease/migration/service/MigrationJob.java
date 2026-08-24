@@ -17,6 +17,7 @@ public final class MigrationJob {
     private final List<SseEmitter> subscribers = new CopyOnWriteArrayList<>();
     private final Instant createdAt = Instant.now();
     private boolean completed;
+    private boolean succeeded;
 
     public void log(String message) {
         String line = "[" + Instant.now() + "] " + message;
@@ -40,12 +41,13 @@ public final class MigrationJob {
         complete(emitter);
     }
 
-    public void complete() {
+    public void complete(boolean succeeded) {
         List<SseEmitter> activeSubscribers;
         synchronized (this) {
             if (completed) {
                 return;
             }
+            this.succeeded = succeeded;
             completed = true;
             activeSubscribers = new ArrayList<>(subscribers);
         }
@@ -66,7 +68,10 @@ public final class MigrationJob {
 
     private void complete(SseEmitter emitter) {
         try {
-            emitter.send(SseEmitter.event().name("complete").data("迁移任务结束"));
+            String message = succeeded
+                    ? "迁移任务成功完成"
+                    : "迁移任务已失败，请根据上方异常明细处理后，使用全新目标库重新迁移";
+            emitter.send(SseEmitter.event().name("complete").data(message));
         } catch (IOException ignored) {
             // The browser may have disconnected before the final event.
         } finally {

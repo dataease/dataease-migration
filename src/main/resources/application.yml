@@ -9,6 +9,9 @@ spring:
       request-timeout: 0
 
 migration:
+  files:
+    # 同步物理日志可能很大，必须由实施人员根据磁盘和传输空间显式开启。
+    copy-sync-task-logs: ${MIGRATION_COPY_SYNC_TASK_LOGS:false}
   ssh:
     connect-timeout-millis: 30000
     command-timeout-millis: 3600000
