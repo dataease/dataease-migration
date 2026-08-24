@@ -13,6 +13,7 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.function.Consumer;
 
 @Component
 public class SshCommandExecutor {
@@ -23,6 +24,38 @@ public class SshCommandExecutor {
     }
 
     public void execute(ServerInfo server, String command, MigrationJob job) throws Exception {
+        runCommand(server, command, job::log);
+    }
+
+    /**
+     * 执行远程命令并返回合并后的标准输出，用于读取 docker-compose.yml 等小文件。
+     * 输出中同时包含命令的标准错误，因此调用方在命令失败时无法区分错误来源，
+     * 错误信息会通过退出码非零体现。
+     */
+    public String capture(ServerInfo server, String command) throws Exception {
+        StringBuilder output = new StringBuilder();
+        runCommand(server, command, line -> {
+            if (!output.isEmpty()) {
+                output.append('\n');
+            }
+            output.append(line);
+        });
+        return output.toString();
+    }
+
+    public String readRemoteFile(ServerInfo server, String remotePath) throws Exception {
+        return capture(server, "cat " + ShellEscaper.quote(remotePath));
+    }
+
+    public void download(ServerInfo server, String remotePath, Path localPath) throws Exception {
+        transfer(server, channel -> channel.get(remotePath, localPath.toString()));
+    }
+
+    public void upload(ServerInfo server, Path localPath, String remotePath) throws Exception {
+        transfer(server, channel -> channel.put(localPath.toString(), remotePath));
+    }
+
+    private void runCommand(ServerInfo server, String command, Consumer<String> lineConsumer) throws Exception {
         Session session = connect(server);
         try {
             ChannelExec channel = (ChannelExec) session.openChannel("exec");
@@ -32,7 +65,7 @@ public class SshCommandExecutor {
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(output, StandardCharsets.UTF_8))) {
                 String line;
                 while ((line = reader.readLine()) != null) {
-                    job.log(line);
+                    lineConsumer.accept(line);
                 }
             }
             while (!channel.isClosed()) {
@@ -45,14 +78,6 @@ public class SshCommandExecutor {
         } finally {
             session.disconnect();
         }
-    }
-
-    public void download(ServerInfo server, String remotePath, Path localPath) throws Exception {
-        transfer(server, channel -> channel.get(remotePath, localPath.toString()));
-    }
-
-    public void upload(ServerInfo server, Path localPath, String remotePath) throws Exception {
-        transfer(server, channel -> channel.put(localPath.toString(), remotePath));
     }
 
     private Session connect(ServerInfo server) throws Exception {

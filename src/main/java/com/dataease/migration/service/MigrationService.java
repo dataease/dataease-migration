@@ -46,6 +46,7 @@ public class MigrationService {
     };
 
     private final SshCommandExecutor ssh;
+    private final DataEaseVersionValidator dataEaseVersionValidator;
     private final DatabaseMigrationSelector databaseMigrator;
     private final TargetDatabaseUpgradeService targetDatabaseUpgradeService;
     private final PluginMigrationService pluginMigrationService;
@@ -54,13 +55,15 @@ public class MigrationService {
     private final boolean copySyncTaskLogs;
     private final Map<String, MigrationJob> jobs = new ConcurrentHashMap<>();
 
-    public MigrationService(SshCommandExecutor ssh, DatabaseMigrationSelector databaseMigrator,
+    public MigrationService(SshCommandExecutor ssh, DataEaseVersionValidator dataEaseVersionValidator,
+                            DatabaseMigrationSelector databaseMigrator,
                             TargetDatabaseUpgradeService targetDatabaseUpgradeService,
                             PluginMigrationService pluginMigrationService,
                             SyncManagementMigrationService syncManagementMigrationService,
                             @Qualifier("migrationExecutor") Executor migrationExecutor,
                             @Value("${migration.files.copy-sync-task-logs:false}") boolean copySyncTaskLogs) {
         this.ssh = ssh;
+        this.dataEaseVersionValidator = dataEaseVersionValidator;
         this.databaseMigrator = databaseMigrator;
         this.targetDatabaseUpgradeService = targetDatabaseUpgradeService;
         this.pluginMigrationService = pluginMigrationService;
@@ -153,6 +156,7 @@ public class MigrationService {
      */
     private void migrateFiles(ServerInfo source, ServerInfo target, String remoteArchive, Path localArchive,
                               MigrationJob job) throws Exception {
+        dataEaseVersionValidator.validate(source, job);
         job.log("开始迁移文件：i18n、font、exportData、map、geo、appearance、static-resource、excel 及插件。");
         String sourceDataDirectory = source.installPath() + "/data";
         boolean sourceLocal = isLocalHost(source.host());
