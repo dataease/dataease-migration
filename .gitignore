@@ -12,6 +12,8 @@
 
 # Package Files #
 *.jar
+# 迁移工具发行包依赖这些内置插件完成 V2 插件元数据升级，必须随源码一起提交。
+!plugins/*.jar
 *.war
 *.nar
 *.ear

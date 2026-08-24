@@ -8,6 +8,8 @@ section { background: white; border: 1px solid #dce3ef; border-radius: 8px; marg
 .grid { display: grid; gap: 16px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
 label { display: grid; font-size: .9rem; font-weight: 600; gap: 7px; }
 input { border: 1px solid #aebbd0; border-radius: 4px; box-sizing: border-box; font: inherit; font-weight: 400; padding: 9px; width: 100%; }
+.connection-mode p { color: #52627a; font-size: .9rem; margin: 0; }
+.connection-mode p + p { margin-top: 10px; }
 .wide { grid-column: span 2; }
 button { background: #0969da; border: 0; border-radius: 5px; color: white; cursor: pointer; font: inherit; margin-top: 20px; padding: 10px 20px; }
 button:disabled { background: #8194ae; cursor: wait; }
