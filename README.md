@@ -26,6 +26,8 @@
 
 工程提供 `Dockerfile`，可将迁移工具构建为镜像并以容器方式运行。镜像基于 `alpine-openjdk21-jre`，内置 JAR 与当前目标架构匹配的 Linux MySQL 客户端工具（`/opt/apps/tools/mysql`），通过 HTTP 提供与本地运行一致的控制台页面。
 
+如果不想自行构建，也可以直接使用已发布的公共镜像 `registry.cn-qingdao.aliyuncs.com/dataease/dataease-migration:latest`（多架构，含 amd64 与 arm64）。
+
 ### 构建镜像
 
 先在 `target/` 下准备好 JAR（执行 `mvn package`），再构建：
@@ -42,13 +44,16 @@ docker buildx build --platform linux/amd64,linux/arm64 -t dataease-migration --p
 
 ### 运行容器
 
+直接使用公共镜像（无需自行构建）：
+
 ```bash
 docker run -d --name migration \
   -p 8080:8080 \
   -e SERVER_PORT=8080 \
-  dataease-migration
+  registry.cn-qingdao.aliyuncs.com/dataease/dataease-migration:latest
 ```
 
+若使用上方自行构建的镜像 `dataease-migration`，把命令最后一行镜像名替换为 `dataease-migration` 即可。
 运行后浏览器访问 `http://localhost:8080` 即可填写源端/目标端信息执行迁移。
 
 ### 参数说明
