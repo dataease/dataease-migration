@@ -15,4 +15,18 @@ button { background: #0969da; border: 0; border-radius: 5px; color: white; curso
 button:disabled { background: #8194ae; cursor: wait; }
 .logs-section { margin-bottom: 32px; }
 pre { background: #101828; color: #d0d5dd; height: 280px; margin: 0; overflow: auto; padding: 16px; white-space: pre-wrap; }
+
+/* 勾选框选项：水平排列，避免被上方 label 的 grid 竖排影响 */
+.checkbox {
+  align-items: center;
+  display: flex;
+  font-weight: 600;
+  gap: 8px;
+  margin-top: 14px;
+}
+.checkbox input {
+  flex: 0 0 auto;
+  width: auto;
+}
+
 @media (max-width: 640px) { .grid { grid-template-columns: 1fr; } .wide { grid-column: auto; } }

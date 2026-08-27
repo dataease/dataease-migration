@@ -70,8 +70,8 @@ public class MigrationService {
         this.syncManagementMigrationService = syncManagementMigrationService;
         this.migrationExecutor = migrationExecutor;
         this.copySyncTaskLogs = copySyncTaskLogs;
-        LOGGER.info("同步任务物理日志复制已{}；启动参数：--migration.files.copy-sync-task-logs={}",
-                copySyncTaskLogs ? "启用" : "关闭", copySyncTaskLogs);
+        LOGGER.info("同步任务物理日志复制默认{}；可在页面勾选“复制同步任务日志”或使用 --migration.files.copy-sync-task-logs=true 覆盖。",
+                copySyncTaskLogs ? "启用" : "关闭");
     }
 
     public String start(MigrationRequest request) {
@@ -115,7 +115,7 @@ public class MigrationService {
 
             currentStage = "文件迁移";
             stageStartedNanos = System.nanoTime();
-            migrateFiles(request.sourceServer(), request.targetServer(), remoteFiles, localFiles, job);
+            migrateFiles(request, remoteFiles, localFiles, job);
             logElapsed(job, currentStage, stageStartedNanos);
 
             currentStage = "数据库迁移";
@@ -154,8 +154,11 @@ public class MigrationService {
      * 文件迁移固定经过迁移程序所在机器的临时归档，从而用同一流程覆盖本地→本地、本地→远程、
      * 远程→本地和远程→远程四种组合；只有文件访问方式不同，迁移内容保持一致。
      */
-    private void migrateFiles(ServerInfo source, ServerInfo target, String remoteArchive, Path localArchive,
+    private void migrateFiles(MigrationRequest request, String remoteArchive, Path localArchive,
                               MigrationJob job) throws Exception {
+        ServerInfo source = request.sourceServer();
+        ServerInfo target = request.targetServer();
+        boolean copySyncTaskLogs = request.copySyncTaskLogs() || this.copySyncTaskLogs;
         dataEaseVersionValidator.validate(source, job);
         job.log("开始迁移文件：i18n、font、exportData、map、geo、appearance、static-resource、excel 及插件。");
         String sourceDataDirectory = source.installPath() + "/data";
@@ -209,7 +212,7 @@ public class MigrationService {
             migrateSyncTaskLogs(source, target, remoteArchive, localArchive, sourceLocal, targetLocal, job);
         } else {
             job.log("未启用同步任务日志复制，跳过 " + SYNC_TASK_LOG_DIRECTORY
-                    + "；可在启动时添加 --migration.files.copy-sync-task-logs=true 开启。");
+                    + "；可在页面勾选“复制同步任务日志”或设置 --migration.files.copy-sync-task-logs=true 开启。");
         }
         job.log("文件迁移完成。");
     }

@@ -14,7 +14,10 @@
       <section class="connection-mode">
         <h2>服务器连接方式</h2>
         <p>工具会分别判断源端和目标端：localhost、127.x、::1 或本机网卡地址直接操作本地安装目录，远程地址通过 SSH 操作。无论使用哪种连接方式，文件、数据库、升级脚本、插件及同步管理都会执行相同的完整迁移流程。</p>
-        <p>同步任务物理日志是否复制由启动参数 <code>--migration.files.copy-sync-task-logs=true</code> 控制，默认关闭；任务日志会显示本次是否启用。</p>
+        <label class="wide checkbox">
+          <input name="copySyncTaskLogs" type="checkbox">
+          复制同步任务物理日志（默认关闭，可大幅增加耗时与磁盘占用）
+        </label>
       </section>
       <section>
         <h2>DataEase 2.0（源端）</h2>

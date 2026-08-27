@@ -8,6 +8,7 @@ function value(data, name) {
 
 function requestFrom(formData) {
   return {
+    copySyncTaskLogs: formData.get('copySyncTaskLogs') === 'on',
     sourceServer: {
       host: value(formData, 'sourceServer.host'),
       port: Number(value(formData, 'sourceServer.port')),
