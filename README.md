@@ -1,6 +1,6 @@
 # DataEase 数据迁移工具
 
-浏览器访问 `http://localhost:8080`，填写 DataEase 2.0 和 3.0 的服务器地址、MySQL 及安装目录信息后执行完整迁移。远程服务器通过 SSH 操作，本地服务器直接操作本地目录。
+浏览器访问 `http://localhost:8080`，填写 DataEase 2.0 和 3.0 的服务器地址、MySQL 及安装目录信息后执行完整迁移。远程服务器通过 SSH 操作，本地服务器直接操作本地目录。工具可以直接运行 JAR，也可以构建为 Docker 镜像运行（见下方「使用 Docker 镜像迁移」）。
 
 迁移顺序为：
 
@@ -21,6 +21,57 @@
 把源端或目标端服务器地址填写为 `localhost`、`127.x`、`::1` 或运行迁移程序这台机器的网卡地址后，工具会直接归档、解压对应的本地安装目录并复制插件 JAR，不会建立 SSH 连接；SSH 端口、用户名和密码可以留空。远程地址仍会通过 SSH 执行相同操作，并要求填写有效的 SSH 配置。
 
 源端和目标端会分别判断，因此支持本地到本地、本地到远程、远程到本地和远程到远程。连接方式不会改变迁移内容，四种组合都会依次执行服务文件迁移、数据库结构及数据复制、`upgrade.sql`、通用插件数据更新、同步管理专项数据转换和同步 PostgreSQL 插件数据更新。直接操作本地文件目前适用于 macOS/Linux，并要求本机提供 `/bin/sh` 和 `tar`。
+
+## 使用 Docker 镜像迁移
+
+工程提供 `Dockerfile`，可将迁移工具构建为镜像并以容器方式运行。镜像基于 `alpine-openjdk21-jre`，内置 JAR 与当前目标架构匹配的 Linux MySQL 客户端工具（`/opt/apps/tools/mysql`），通过 HTTP 提供与本地运行一致的控制台页面。
+
+### 构建镜像
+
+先在 `target/` 下准备好 JAR（执行 `mvn package`），再构建：
+
+```bash
+# 单架构（当前 buildx 默认目标架构）
+docker build -t dataease-migration .
+
+# 多架构（amd64 + arm64）
+docker buildx build --platform linux/amd64,linux/arm64 -t dataease-migration --push .
+```
+
+构建时会按目标架构（`TARGETARCH`）自动挑选匹配的 Linux 客户端工具：`amd64` 使用 `linux-x64`，`arm64` 使用 `linux-arm64`；macOS/Windows 工具不会被打入镜像。被选中的工具需已放入 `tools/mysql/<平台>/bin`，否则容器内仍会回退到内置 JDBC 迁移。
+
+### 运行容器
+
+```bash
+docker run -d --name migration \
+  -p 8080:8080 \
+  -e SERVER_PORT=8080 \
+  dataease-migration
+```
+
+运行后浏览器访问 `http://localhost:8080` 即可填写源端/目标端信息执行迁移。
+
+### 参数说明
+
+通过 `-e` 传入的环境变量与直接运行 JAR 时的参数一一对应：
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `SERVER_PORT` | `8080` | 控制台 HTTP 服务端口，需与 `-p` 映射一致 |
+| `MIGRATION_COPY_SYNC_TASK_LOGS` | `false` | 是否复制同步任务物理日志 |
+| `MIGRATION_MYSQL_TOOLS_DIRECTORY` | `/opt/apps/tools/mysql` | MySQL 客户端工具根目录（镜像内置，一般无需改动） |
+
+示例（开启同步日志复制并改用 8018 端口）：
+
+```bash
+docker run -d --name migration \
+  -p 8018:8018 \
+  -e SERVER_PORT=8018 \
+  -e MIGRATION_COPY_SYNC_TASK_LOGS=true \
+  dataease-migration
+```
+
+> 镜像内已内置与目标架构匹配的 MySQL 客户端工具，容器可直接使用原生 `mysql`/`mysqldump` 迁移，无需在宿主机安装 MySQL 客户端；只有当 `TARGETARCH` 对应平台的 `tools` 未随构建打入时，才回退到 JDBC 迁移。
 
 ## 同步任务日志复制开关
 
