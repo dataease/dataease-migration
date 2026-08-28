@@ -16,6 +16,7 @@ STOPSIGNAL SIGTERM
 WORKDIR /opt/apps
 
 ADD target/dataease-migration-1.0.0.jar /opt/apps/app.jar
+COPY plugins /deployments/plugins
 COPY --from=tools /staging/tools/mysql /opt/apps/tools/mysql
 
 ENV JAVA_APP_JAR=/opt/apps/app.jar
