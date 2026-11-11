@@ -1,6 +1,7 @@
 SET SQL_SAFE_UPDATES = 0;
 UPDATE core_menu SET auth = TRUE WHERE id = 64;
 UPDATE core_menu SET menu_sort = 4, auth = TRUE WHERE id = 16;
+UPDATE core_menu SET menu_sort = 20, auth = TRUE WHERE id = 31;
 
 ALTER TABLE xpack_log MODIFY COLUMN oid BIGINT NULL COMMENT '组织ID';
 ALTER TABLE xpack_share MODIFY COLUMN oid BIGINT NULL COMMENT '组织ID';

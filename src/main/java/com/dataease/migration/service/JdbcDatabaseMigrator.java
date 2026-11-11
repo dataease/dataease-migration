@@ -85,6 +85,9 @@ public class JdbcDatabaseMigrator implements DatabaseMigrator {
         Properties properties = new Properties();
         properties.setProperty("user", database.username());
         properties.setProperty("password", database.password());
+        // TINYINT(1) is a numeric SQL type, not restricted to 0/1. Preserve its
+        // physical values instead of letting Connector/J coerce them to Boolean.
+        properties.setProperty("tinyInt1isBit", "false");
         if (optimizeBatchWrites) {
             properties.setProperty("rewriteBatchedStatements", "true");
             properties.setProperty("useServerPrepStmts", "false");
@@ -120,13 +123,13 @@ public class JdbcDatabaseMigrator implements DatabaseMigrator {
 
     private void copyTableData(Connection source, Connection target, String sourceDatabase, String targetDatabase,
                                String table, MigrationJob job) throws SQLException {
-        List<String> columns = migratableColumns(source, sourceDatabase, table);
+        List<Column> columns = migratableColumns(source, sourceDatabase, table);
         if (columns.isEmpty()) {
             return;
         }
         String sourceTable = qualifiedName(sourceDatabase, table);
         String targetTable = qualifiedName(targetDatabase, table);
-        String quotedColumns = String.join(", ", columns.stream().map(ShellEscaper::sqlIdentifier).toList());
+        String quotedColumns = String.join(", ", columns.stream().map(c -> ShellEscaper.sqlIdentifier(c.name())).toList());
         String placeholders = String.join(", ", columns.stream().map(column -> "?").toList());
         String select = "SELECT " + quotedColumns + " FROM " + sourceTable;
         String insert = "INSERT INTO " + targetTable + " (" + quotedColumns + ") VALUES (" + placeholders + ")";
@@ -141,7 +144,11 @@ public class JdbcDatabaseMigrator implements DatabaseMigrator {
                 int pendingBatchRows = 0;
                 while (rows.next()) {
                     for (int index = 0; index < columns.size(); index++) {
-                        write.setObject(index + 1, rows.getObject(index + 1));
+                        if (columns.get(index).tinyInteger()) {
+                            int value = rows.getInt(index + 1);
+                            if (rows.wasNull()) write.setNull(index + 1, java.sql.Types.TINYINT);
+                            else write.setInt(index + 1, value);
+                        } else write.setObject(index + 1, rows.getObject(index + 1));
                     }
                     write.addBatch();
                     rowCount++;
@@ -186,14 +193,19 @@ public class JdbcDatabaseMigrator implements DatabaseMigrator {
         return String.format(Locale.ROOT, "%.2f 秒", elapsedMillis / 1_000.0);
     }
 
-    private List<String> migratableColumns(Connection connection, String database, String table) throws SQLException {
-        List<String> columns = new ArrayList<>();
-        try (Statement statement = connection.createStatement();
-             ResultSet result = statement.executeQuery("SHOW COLUMNS FROM " + qualifiedName(database, table))) {
-            while (result.next()) {
-                String extra = result.getString("Extra");
-                if (extra == null || !extra.contains("GENERATED")) {
-                    columns.add(result.getString("Field"));
+    private record Column(String name, boolean tinyInteger) {}
+
+    private List<Column> migratableColumns(Connection connection, String database, String table) throws SQLException {
+        List<Column> columns = new ArrayList<>();
+        try (PreparedStatement query = connection.prepareStatement(
+                "SELECT COLUMN_NAME,GENERATION_EXPRESSION,DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS"
+                        + " WHERE TABLE_SCHEMA=? AND TABLE_NAME=? ORDER BY ORDINAL_POSITION")) {
+            query.setString(1, database); query.setString(2, table);
+            try (ResultSet result = query.executeQuery()) {
+                while (result.next()) {
+                    String expression = result.getString(2);
+                    if (expression == null || expression.isBlank())
+                        columns.add(new Column(result.getString(1), "tinyint".equalsIgnoreCase(result.getString(3))));
                 }
             }
         }

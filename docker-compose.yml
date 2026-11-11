@@ -1,0 +1,14 @@
+services:
+  migration:
+    image: "${OPERATIONS_IMAGE:-registry.cn-qingdao.aliyuncs.com/dataease/dataease-migration:v1.1}"
+    ports:
+      - target: 8080
+        published: "${OPERATIONS_HOST_PORT:-8080}"
+        host_ip: "${OPERATIONS_HOST_ADDRESS:-127.0.0.1}"
+    environment:
+      - OPERATIONS_ADMIN_PASSWORD
+    volumes:
+      - operations-data:/opt/apps/data/operations
+
+volumes:
+  operations-data:

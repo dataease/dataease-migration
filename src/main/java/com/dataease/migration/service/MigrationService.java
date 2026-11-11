@@ -1,6 +1,7 @@
 package com.dataease.migration.service;
 
 import com.dataease.migration.model.DatabaseConnection;
+import com.dataease.migration.model.DatabaseInfo;
 import com.dataease.migration.model.MigrationRequest;
 import com.dataease.migration.model.ServerInfo;
 import org.slf4j.Logger;
@@ -10,6 +11,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.net.InetAddress;
+import java.sql.SQLException;
 import java.net.NetworkInterface;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -75,23 +77,39 @@ public class MigrationService {
     }
 
     public String start(MigrationRequest request) {
-        if (request.sourceServer() == null || request.targetServer() == null) {
-            throw new IllegalArgumentException("迁移必须填写源端和目标端服务器配置");
-        }
-        validateServer(request.sourceServer(), "DataEase 2.0");
-        validateServer(request.targetServer(), "DataEase 3.0");
-        DatabaseConnection sourceDatabase = DatabaseConnection.fromJdbcUrl(request.sourceDatabase().jdbcUrl());
-        DatabaseConnection targetDatabase = DatabaseConnection.fromJdbcUrl(request.targetDatabase().jdbcUrl());
-        // 目标库会在数据库阶段先被删除；任务入队前拒绝明确相同的库，避免把源数据一起删除。
-        if (sameDatabase(sourceDatabase, targetDatabase)) {
-            throw new IllegalArgumentException("源数据库和目标数据库不能相同，目标库会被删除并重建");
-        }
-
+        validateRequest(request);
         String id = UUID.randomUUID().toString();
         MigrationJob job = new MigrationJob();
         jobs.put(id, job);
         migrationExecutor.execute(() -> runMigration(request, job, id));
         return id;
+    }
+
+    public void execute(MigrationRequest request, MigrationJob job) throws Exception {
+        validateRequest(request);
+        runMigration(request, job, UUID.randomUUID().toString());
+        if (!job.isSucceeded()) {
+            throw new IllegalStateException("迁移引擎执行失败，请查看任务阶段日志；目标可能已发生写入", job.failure());
+        }
+    }
+
+    private void validateRequest(MigrationRequest request) {
+        if (request == null || request.sourceServer() == null || request.targetServer() == null
+                || request.sourceDatabase() == null || request.targetDatabase() == null) {
+            throw new IllegalArgumentException("迁移必须填写两端服务器与数据库配置");
+        }
+        validateServer(request.sourceServer(), "DataEase 2.0");
+        validateServer(request.targetServer(), "DataEase 3.0");
+        DatabaseConnection sourceDatabase = DatabaseConnection.fromJdbcUrl(request.sourceDatabase().jdbcUrl());
+        DatabaseConnection targetDatabase = DatabaseConnection.fromJdbcUrl(request.targetDatabase().jdbcUrl());
+        if (sameDatabase(sourceDatabase, targetDatabase)) {
+            throw new IllegalArgumentException("源数据库和目标数据库不能相同，目标库会被删除并重建");
+        }
+        ServerInfo a=request.sourceServer(), b=request.targetServer();
+        if (a.host().equalsIgnoreCase(b.host()) || isLocalServer(a) && isLocalServer(b)) {
+            Path x=Path.of(a.installPath()).normalize(), y=Path.of(b.installPath()).normalize();
+            if(x.startsWith(y)||y.startsWith(x)) throw new IllegalArgumentException("同机源与目标安装目录不能相同或互相包含");
+        }
     }
 
     public MigrationJob getJob(String id) {
@@ -111,6 +129,8 @@ public class MigrationService {
         long stageStartedNanos;
         try {
             job.log("开始完整迁移任务；源端和目标端将分别自动选择本地文件访问或 SSH 访问。");
+            currentStage = "数据库兼容预检";
+            validateSchemas(request.sourceDatabase(), request.targetDatabase());
             localFiles = Files.createTempFile("dataease-files-", ".tar.gz");
 
             currentStage = "文件迁移";
@@ -139,6 +159,7 @@ public class MigrationService {
             job.log("完整迁移完成，总耗时：" + formatElapsed(taskStartedNanos) + "。");
             succeeded = true;
         } catch (Exception e) {
+            job.fail(e);
             // 页面展示失败阶段和根因链，服务端日志保留完整堆栈，便于实施和研发分别定位。
             job.log("迁移失败，阶段：" + currentStage + "；原因：" + detailedMessage(e));
             LOGGER.error("迁移任务 {} 在阶段 [{}] 失败", id, currentStage, e);
@@ -154,16 +175,26 @@ public class MigrationService {
      * 文件迁移固定经过迁移程序所在机器的临时归档，从而用同一流程覆盖本地→本地、本地→远程、
      * 远程→本地和远程→远程四种组合；只有文件访问方式不同，迁移内容保持一致。
      */
+    public void validateSchemas(DatabaseInfo source, DatabaseInfo target) throws SQLException {
+        targetDatabaseUpgradeService.validateSourceAndTarget(source, target);
+        syncManagementMigrationService.validateSource(source);
+    }
+
+    public void validateDependencies(String targetInstallPath) {
+        pluginMigrationService.validateBundledPlugins(targetInstallPath);
+    }
+
     private void migrateFiles(MigrationRequest request, String remoteArchive, Path localArchive,
                               MigrationJob job) throws Exception {
         ServerInfo source = request.sourceServer();
         ServerInfo target = request.targetServer();
+        validateDependencies(target.installPath());
         boolean copySyncTaskLogs = request.copySyncTaskLogs() || this.copySyncTaskLogs;
         dataEaseVersionValidator.validate(source, job);
         job.log("开始迁移文件：i18n、font、exportData、map、geo、appearance、static-resource、excel 及插件。");
         String sourceDataDirectory = source.installPath() + "/data";
-        boolean sourceLocal = isLocalHost(source.host());
-        boolean targetLocal = isLocalHost(target.host());
+        boolean sourceLocal = isLocalServer(source);
+        boolean targetLocal = isLocalServer(target);
         long stepStartedNanos = System.nanoTime();
         if (sourceLocal) {
             job.log("源端地址 " + source.host() + " 属于本机，直接读取本地安装目录，不建立 SSH 连接。");
@@ -331,7 +362,7 @@ public class MigrationService {
             throw new IllegalArgumentException(productName + " 服务器 IP 不能为空");
         }
         validateLinuxInstallPath(server.installPath(), productName);
-        if (isLocalHost(server.host())) {
+        if (isLocalServer(server)) {
             return;
         }
         if (server.port() < 1 || server.port() > 65535) {
@@ -340,8 +371,8 @@ public class MigrationService {
         if (server.username() == null || server.username().isBlank()) {
             throw new IllegalArgumentException(productName + " 远程地址必须填写 SSH 用户名");
         }
-        if (server.password() == null || server.password().isBlank()) {
-            throw new IllegalArgumentException(productName + " 远程地址必须填写 SSH 密码");
+        if ((server.password() == null || server.password().isBlank()) && (server.privateKey() == null || server.privateKey().isBlank())) {
+            throw new IllegalArgumentException(productName + " 远程地址必须填写 SSH 密码或私钥");
         }
     }
 
@@ -349,7 +380,11 @@ public class MigrationService {
      * localhost、环回地址以及绑定在当前机器网卡上的地址都视为本地地址。域名解析失败时按远程地址处理，
      * 后续会按远程服务器规则校验 SSH 配置，避免误将不可识别的主机当成本地文件系统。
      */
-    static boolean isLocalHost(String host) {
+    public static boolean isLocalServer(ServerInfo server) {
+        return !"ssh".equals(server.connectionMode()) && isLocalHost(server.host());
+    }
+
+    public static boolean isLocalHost(String host) {
         if (host == null || host.isBlank()) {
             return false;
         }
@@ -418,7 +453,7 @@ public class MigrationService {
 
     private void cleanup(ServerInfo server, String remoteFiles, MigrationJob job) {
         // 本地归档由 deleteQuietly 负责；只有远程分支会在服务器 /tmp 中创建同名文件。
-        if (isLocalHost(server.host())) {
+        if (isLocalServer(server)) {
             return;
         }
         try {

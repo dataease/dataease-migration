@@ -2,56 +2,47 @@ package com.dataease.migration.service;
 
 import com.dataease.migration.model.ServerInfo;
 import org.springframework.stereotype.Component;
+import com.dataease.migration.operations.exec.ComposeManager;
+import org.yaml.snakeyaml.Yaml;
+import org.yaml.snakeyaml.LoaderOptions;
+import org.yaml.snakeyaml.constructor.SafeConstructor;
+import java.util.*;
 
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-/**
- * 校验 DataEase 2.0 源端版本是否满足迁移工具的最低要求。
- *
- * <p>版本读取自安装目录下的 docker-compose.yml：定位 {@code dataease} 服务块中的 {@code image}，
- * 再取镜像最后一个冒号之后的 tag。tag 为 {@code dev-v2}，或解析为 {@code v2.10.26} 及以上版本时通过。</p>
- */
+/** Uses the same resolved Compose configuration as instance registration. */
 @Component
 public class DataEaseVersionValidator {
-    private static final String COMPOSE_FILE_NAME = "docker-compose.yml";
     private static final String MINIMUM_TAG = "v2.10.26";
     private static final String DEV_TAG = "dev-v2";
     private static final String UNSUPPORTED_MESSAGE = "dataease最低版本为v2.10.26";
     private static final Pattern VERSION_PATTERN = Pattern.compile("[vV]?(\\d+)\\.(\\d+)\\.(\\d+)");
     private static final int[] MINIMUM_VERSION = parseVersion(MINIMUM_TAG);
 
-    private final SshCommandExecutor ssh;
+    private final ComposeManager compose;
 
-    public DataEaseVersionValidator(SshCommandExecutor ssh) {
-        this.ssh = ssh;
+    public DataEaseVersionValidator(ComposeManager compose) {
+        this.compose = compose;
     }
 
     public void validate(ServerInfo source, MigrationJob job) throws Exception {
-        String composePath = source.installPath() + "/" + COMPOSE_FILE_NAME;
-        job.log("开始校验 DataEase 2.0 版本，读取 " + composePath + "。");
-        String composeContent;
-        try {
-            if (MigrationService.isLocalHost(source.host())) {
-                composeContent = readLocalComposeFile(composePath);
-            } else {
-                composeContent = ssh.readRemoteFile(source, composePath);
-            }
-        } catch (Exception e) {
-            job.log("读取 docker-compose.yml 失败：" + safeMessage(e) + "。");
-            throw new IllegalArgumentException(UNSUPPORTED_MESSAGE);
-        }
-
-        String image = findDataEaseImage(composeContent);
-        if (image == null) {
-            job.log("docker-compose.yml 中未找到 dataease 服务的 image 配置。");
-            throw new IllegalArgumentException(UNSUPPORTED_MESSAGE);
-        }
+        Map<String, Object> instance = new LinkedHashMap<>();
+        instance.put("host", source.host());
+        instance.put("path", source.installPath());
+        instance.put("connection", MigrationService.isLocalServer(source) ? "local" : "ssh");
+        Map<String, String> credentials = new LinkedHashMap<>();
+        credentials.put("sshPort", String.valueOf(source.port()));
+        if (source.username() != null) credentials.put("sshUser", source.username());
+        if (source.password() != null) credentials.put("sshPassword", source.password());
+        if (source.privateKey() != null) credentials.put("privateKey", source.privateKey());
+        if (source.passphrase() != null) credentials.put("passphrase", source.passphrase());
+        if (source.hostKey() != null) credentials.put("hostKey", source.hostKey());
+        job.log("开始复核源端实际Compose镜像版本。");
+        String image = findImage(compose.config(instance, credentials));
+        if (image == null) throw new IllegalArgumentException(UNSUPPORTED_MESSAGE);
         String tag = tagOf(image);
-        if (!isSupportedTag(tag)) {
+        if (!isSupportedTag(tag) || !(DEV_TAG.equals(tag) || tag != null && tag.matches("[vV]?2\\.\\d+\\.\\d+"))) {
             job.log("dataease 镜像标签不满足最低版本要求：" + (tag == null ? image : tag)
                     + "，最低要求为 " + MINIMUM_TAG + "。");
             throw new IllegalArgumentException(UNSUPPORTED_MESSAGE);
@@ -59,49 +50,25 @@ public class DataEaseVersionValidator {
         job.log("DataEase 2.0 版本校验通过，镜像标签：" + tag + "。");
     }
 
-    private String readLocalComposeFile(String composePath) throws Exception {
-        Path composeFile = Path.of(composePath);
-        if (!Files.isRegularFile(composeFile)) {
-            throw new IllegalArgumentException("未找到文件：" + composePath);
-        }
-        return Files.readString(composeFile, StandardCharsets.UTF_8);
+    static String findDataEaseImage(String content) {
+        if (content == null || content.isBlank()) return null;
+        Object parsed = new Yaml(new SafeConstructor(new LoaderOptions())).load(content);
+        return parsed instanceof Map<?, ?> map ? findImage(map) : null;
     }
 
-    /**
-     * 定位 docker-compose.yml 中 {@code dataease} 服务块，并返回该块内的镜像值。
-     * 采用行级解析，避免引入额外的 YAML 依赖；按缩进识别服务块边界，防止把 mysql 等
-     * 相邻服务的 image 误认为 dataease 的镜像。
-     */
-    static String findDataEaseImage(String composeContent) {
-        if (composeContent == null || composeContent.isBlank()) {
-            return null;
+    private static String findImage(Map<?, ?> config) {
+        Map<?, ?> services = config.get("services") instanceof Map<?, ?> map ? map : config;
+        String found = null;
+        for (var entry : services.entrySet()) {
+            if (!(entry.getValue() instanceof Map<?, ?> service)
+                    || !(service.get("image") instanceof String image)) continue;
+            String repository = image.substring(image.lastIndexOf('/') + 1).split(":")[0];
+            if (!"dataease".equals(entry.getKey()) && !repository.equals("dataease")
+                    && !repository.startsWith("dataease-")) continue;
+            if (found != null) throw new IllegalArgumentException("源端Compose包含多个DataEase应用");
+            found = image;
         }
-        String[] lines = composeContent.split("\\r?\\n");
-        Integer dataEaseIndent = null;
-        for (String line : lines) {
-            String trimmed = line.trim();
-            if (trimmed.isEmpty() || trimmed.startsWith("#")) {
-                continue;
-            }
-            if (dataEaseIndent == null) {
-                if ("dataease".equals(keyOf(line))) {
-                    dataEaseIndent = indentOf(line);
-                }
-                continue;
-            }
-            int currentIndent = indentOf(line);
-            if (currentIndent <= dataEaseIndent) {
-                dataEaseIndent = null;
-                if ("dataease".equals(keyOf(line))) {
-                    dataEaseIndent = currentIndent;
-                }
-                continue;
-            }
-            if ("image".equals(keyOf(line))) {
-                return valueOf(line);
-            }
-        }
-        return null;
+        return found;
     }
 
     /**
@@ -161,41 +128,4 @@ public class DataEaseVersionValidator {
         return 0;
     }
 
-    private static int indentOf(String line) {
-        int indent = 0;
-        while (indent < line.length() && (line.charAt(indent) == ' ' || line.charAt(indent) == '\t')) {
-            indent++;
-        }
-        return indent;
-    }
-
-    private static String keyOf(String line) {
-        String trimmed = line.trim();
-        int colon = trimmed.indexOf(':');
-        return colon < 0 ? trimmed : trimmed.substring(0, colon).trim();
-    }
-
-    private static String valueOf(String line) {
-        String trimmed = line.trim();
-        int colon = trimmed.indexOf(':');
-        if (colon < 0) {
-            return "";
-        }
-        String value = trimmed.substring(colon + 1).trim();
-        int comment = value.indexOf(" #");
-        if (comment >= 0) {
-            value = value.substring(0, comment);
-        }
-        value = value.trim();
-        if (value.length() >= 2 && ((value.startsWith("\"") && value.endsWith("\""))
-                || (value.startsWith("'") && value.endsWith("'")))) {
-            value = value.substring(1, value.length() - 1);
-        }
-        return value.trim();
-    }
-
-    private String safeMessage(Exception exception) {
-        String message = exception.getMessage();
-        return message == null || message.isBlank() ? exception.getClass().getSimpleName() : message;
-    }
 }

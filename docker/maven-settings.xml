@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<settings xmlns="http://maven.apache.org/SETTINGS/1.2.0">
+    <mirrors>
+        <mirror>
+            <id>build-central</id>
+            <mirrorOf>central</mirrorOf>
+            <url>${env.MAVEN_MIRROR_URL}</url>
+        </mirror>
+    </mirrors>
+</settings>

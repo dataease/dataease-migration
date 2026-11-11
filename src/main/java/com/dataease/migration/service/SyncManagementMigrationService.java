@@ -93,6 +93,19 @@ public class SyncManagementMigrationService {
         job.log("同步管理专项迁移完成。");
     }
 
+    public void validateSource(DatabaseInfo source) throws SQLException {
+        try (Connection connection = DriverManager.getConnection(source.jdbcUrl(), source.username(), source.password())) {
+            Set<String> existing = findExistingTables(connection);
+            if (classifyTables(existing) == SyncSchemaStatus.PARTIAL) {
+                Set<String> missing = new TreeSet<>(REQUIRED_TABLES);
+                missing.removeAll(existing);
+                throw new SQLException("V2同步管理表不完整，缺少：" + String.join("、", missing));
+            }
+            if (classifyTables(existing) == SyncSchemaStatus.READY && !findInvalidSyncTasks(connection).isEmpty())
+                throw new SQLException("V2同步任务参数无效，请修复源端任务后重新预检查；尚未覆盖目标");
+        }
+    }
+
     static SyncSchemaStatus classifyTables(Set<String> existingTables) {
         long matches = REQUIRED_TABLES.stream().filter(existingTables::contains).count();
         if (matches == 0) {

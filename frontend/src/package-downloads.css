@@ -1,0 +1,14 @@
+.ap-dialog .pd-source-tabs { margin: -4px 0 20px; padding-inline: 0; }
+.pd-options { margin: 16px 0; }
+.pd-options > summary { color: var(--text-secondary); cursor: pointer; padding-bottom: 12px; }
+.pd-market-toolbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; margin-bottom: 14px; }
+.ap-dialog .pd-market-toolbar > .field { flex: 1 1 124px; margin: 0; }
+.pd-market-toolbar > .button { height: 36px; min-width: 100px; margin-left: auto; }
+.pd-market-notes { color: var(--text-muted); font-size: var(--text-support-size); line-height: 1.8; }
+.pd-progress { min-width: 180px; }
+.pd-progress-label { display: flex; justify-content: space-between; gap: 8px; color: var(--text-muted); font-size: var(--text-caption-size); margin-bottom: 7px; }
+.pd-progress-track { height: 5px; background: #eaf0f7; border-radius: 4px; overflow: hidden; }
+.pd-progress-track > span { display: block; height: 100%; background: #3b6bff; border-radius: inherit; }
+.pd-table td:first-child { width: 30%; max-width: 350px; overflow-wrap: anywhere; }
+.pd-table td:first-child strong { font-weight: 500; }
+.pd-empty { padding: 48px 24px; text-align: center; color: var(--text-muted); }

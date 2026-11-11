@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.springframework.stereotype.Service;
+import org.springframework.beans.factory.annotation.Value;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -53,6 +54,8 @@ public class PluginMigrationService {
     );
 
     private final ObjectMapper objectMapper;
+    @Value("${migration.plugins.directory:plugins}")
+    private String pluginDirectory = "plugins";
 
     public PluginMigrationService(ObjectMapper objectMapper) {
         this.objectMapper = objectMapper;
@@ -64,11 +67,20 @@ public class PluginMigrationService {
     }
 
     List<Path> basePluginJars() {
-        return BASE_PLUGIN_JARS.stream().map(jar -> Path.of("plugins", jar)).toList();
+        return BASE_PLUGIN_JARS.stream().map(jar -> Path.of(pluginDirectory, jar)).toList();
     }
 
     List<Path> syncPluginJars() {
-        return SYNC_PLUGIN_JARS.stream().map(jar -> Path.of("plugins", jar)).toList();
+        return SYNC_PLUGIN_JARS.stream().map(jar -> Path.of(pluginDirectory, jar)).toList();
+    }
+
+    public void validateBundledPlugins(String targetInstallPath) {
+        try {
+            loadPlugins(BASE_PLUGIN_IDS, basePluginJars(), targetInstallPath);
+            loadPlugins(SYNC_PLUGIN_IDS, syncPluginJars(), targetInstallPath);
+        } catch (IOException | RuntimeException unavailable) {
+            throw new IllegalArgumentException("迁移所需的内置V3插件缺失或无效，请检查发行包及插件目录配置", unavailable);
+        }
     }
 
     public void updatePlugins(DatabaseInfo target, String targetInstallPath, MigrationJob job) throws Exception {

@@ -16,12 +16,39 @@ public final class MigrationJob {
     private final List<String> logs = new CopyOnWriteArrayList<>();
     private final List<SseEmitter> subscribers = new CopyOnWriteArrayList<>();
     private final Instant createdAt = Instant.now();
-    private boolean completed;
-    private boolean succeeded;
+    private final java.util.function.Consumer<String> listener;
+    private volatile boolean completed;
+    private volatile boolean succeeded;
+    private volatile Throwable failure;
+
+    public MigrationJob() {
+        this(null);
+    }
+
+    public MigrationJob(java.util.function.Consumer<String> listener) {
+        this.listener = listener;
+    }
+
+    public boolean isCompleted() {
+        return completed;
+    }
+
+    public boolean isSucceeded() {
+        return succeeded;
+    }
+
+    public void fail(Throwable failure) {
+        this.failure = failure;
+    }
+
+    public Throwable failure() {
+        return failure;
+    }
 
     public void log(String message) {
         String line = "[" + Instant.now() + "] " + message;
         logs.add(line);
+        if (listener != null) listener.accept(line);
         LOGGER.info(line);
         for (SseEmitter subscriber : subscribers) {
             send(subscriber, "log", line);
@@ -68,9 +95,7 @@ public final class MigrationJob {
 
     private void complete(SseEmitter emitter) {
         try {
-            String message = succeeded
-                    ? "迁移任务成功完成"
-                    : "迁移任务已失败，请根据上方异常明细处理后，使用全新目标库重新迁移";
+            String message = succeeded ? "迁移任务成功完成" : "迁移任务已失败，请根据上方异常明细处理后，使用全新目标库重新迁移";
             emitter.send(SseEmitter.event().name("complete").data(message));
         } catch (IOException ignored) {
             // The browser may have disconnected before the final event.

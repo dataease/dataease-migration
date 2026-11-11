@@ -7,8 +7,18 @@ spring:
   mvc:
     async:
       request-timeout: 0
+  servlet:
+    multipart:
+      max-file-size: ${OPERATIONS_UPLOAD_LIMIT:20GB}
+      max-request-size: ${OPERATIONS_UPLOAD_LIMIT:20GB}
+
+operations:
+  data-directory: ${OPERATIONS_DATA_DIRECTORY:data/operations}
+  allowed-origins: ${OPERATIONS_ALLOWED_ORIGINS:}
 
 migration:
+  plugins:
+    directory: ${MIGRATION_PLUGINS_DIRECTORY:plugins}
   files:
     # 同步物理日志可能很大，必须由实施人员根据磁盘和传输空间显式开启。
     copy-sync-task-logs: ${MIGRATION_COPY_SYNC_TASK_LOGS:false}
