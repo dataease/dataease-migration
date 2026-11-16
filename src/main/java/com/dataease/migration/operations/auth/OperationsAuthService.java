@@ -87,12 +87,23 @@ public final class OperationsAuthService {
     public synchronized Session login(
             String username, String password, HttpServletRequest request) {
         if (account == null) throw OperationsApiException.conflict("请先在运维服务本机初始化管理员密码");
+        verifyPassword("admin".equals(username), password, request, HttpStatus.UNAUTHORIZED);
+        return newSession();
+    }
+
+    public synchronized void requirePassword(String password, HttpServletRequest request) {
+        if (session(request).isEmpty())
+            throw new OperationsApiException(HttpStatus.UNAUTHORIZED, "管理员会话已失效");
+        verifyPassword(true, password, request, HttpStatus.FORBIDDEN);
+    }
+
+    private void verifyPassword(boolean validUsername, String password, HttpServletRequest request, HttpStatus failure) {
         String address = request.getRemoteAddr();
         long now = System.currentTimeMillis();
         Attempts recent = attempts.get(address);
         if (recent != null && now - recent.startedAt < ATTEMPT_WINDOW && recent.count >= 5)
             throw new OperationsApiException(HttpStatus.TOO_MANY_REQUESTS, "登录失败次数过多，请稍后重试");
-        boolean valid = "admin".equals(username) && matches(password, account);
+        boolean valid = validUsername && matches(password, account);
         if (!valid) {
             attempts.compute(
                     address,
@@ -103,10 +114,10 @@ public final class OperationsAuthService {
             if (attempts.size() > 1_000)
                 attempts.entrySet()
                         .removeIf(entry -> now - entry.getValue().startedAt >= ATTEMPT_WINDOW);
-            throw new OperationsApiException(HttpStatus.UNAUTHORIZED, "管理员账号或密码错误");
+            throw new OperationsApiException(failure, failure == HttpStatus.UNAUTHORIZED
+                    ? "管理员账号或密码错误" : "运维中心管理员密码不正确");
         }
         attempts.remove(address);
-        return newSession();
     }
 
     public Optional<Session> session(HttpServletRequest request) {

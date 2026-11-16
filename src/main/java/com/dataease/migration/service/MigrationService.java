@@ -26,6 +26,7 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
 /**
  * 编排一次完整的 V2 到 V3 迁移。
@@ -36,15 +37,33 @@ import java.util.concurrent.TimeUnit;
  */
 @Service
 public class MigrationService {
+    public enum Phase {
+        RESOURCES("迁移资源文件", 55),
+        DATABASE("迁移数据库", 63),
+        SCHEMA("转换 V3 数据库结构", 72),
+        PLUGINS("迁移插件", 79),
+        SYNC("转换数据同步任务", 83),
+        ENGINE("重绑定数据引擎并核对数据", 87);
+
+        private final String title;
+        private final int milestone;
+
+        Phase(String title, int milestone) {
+            this.title = title;
+            this.milestone = milestone;
+        }
+
+        public String title() { return title; }
+        public int milestone() { return milestone; }
+    }
     private static final Logger LOGGER = LoggerFactory.getLogger(MigrationService.class);
     private static final String FILE_ARCHIVE_PREFIX = "/tmp/dataease-files-";
     private static final String SYNC_TASK_LOG_DIRECTORY = "logs/sync-task/task-handler-log";
     /**
-     * V2 持久化数据目录。不同版本或部署方式可能缺少其中部分目录，所以打包时按实际存在情况选择；
-     * excel 必须保留，否则 Excel 数据集的原始上传文件会在数据库迁移成功后丢失。
+     * 按实际存在情况打包 V2 资源目录。已导入的 Excel 数据随数据库迁移。
      */
     private static final String[] DATA_DIRECTORIES = {
-            "i18n", "font", "exportData", "map", "geo", "appearance", "static-resource", "excel"
+            "i18n", "font", "exportData", "map", "geo", "appearance", "static-resource"
     };
 
     private final SshCommandExecutor ssh;
@@ -81,16 +100,22 @@ public class MigrationService {
         String id = UUID.randomUUID().toString();
         MigrationJob job = new MigrationJob();
         jobs.put(id, job);
-        migrationExecutor.execute(() -> runMigration(request, job, id));
+        migrationExecutor.execute(() -> runMigration(request, job, id, phase -> {}, () -> {}));
         return id;
     }
 
-    public void execute(MigrationRequest request, MigrationJob job) throws Exception {
+    public void execute(MigrationRequest request, MigrationJob job, Consumer<Phase> progress,
+            BeforeResourceCopy beforeResourceCopy) throws Exception {
         validateRequest(request);
-        runMigration(request, job, UUID.randomUUID().toString());
+        runMigration(request, job, UUID.randomUUID().toString(), progress, beforeResourceCopy);
         if (!job.isSucceeded()) {
             throw new IllegalStateException("迁移引擎执行失败，请查看任务阶段日志；目标可能已发生写入", job.failure());
         }
+    }
+
+    @FunctionalInterface
+    public interface BeforeResourceCopy {
+        void run() throws Exception;
     }
 
     private void validateRequest(MigrationRequest request) {
@@ -120,7 +145,8 @@ public class MigrationService {
         return job;
     }
 
-    private void runMigration(MigrationRequest request, MigrationJob job, String id) {
+    private void runMigration(MigrationRequest request, MigrationJob job, String id, Consumer<Phase> progress,
+            BeforeResourceCopy beforeResourceCopy) {
         Path localFiles = null;
         String remoteFiles = FILE_ARCHIVE_PREFIX + id + ".tar.gz";
         String currentStage = "初始化迁移任务";
@@ -133,26 +159,31 @@ public class MigrationService {
             validateSchemas(request.sourceDatabase(), request.targetDatabase());
             localFiles = Files.createTempFile("dataease-files-", ".tar.gz");
 
-            currentStage = "文件迁移";
+            currentStage = Phase.RESOURCES.title();
+            progress.accept(Phase.RESOURCES);
             stageStartedNanos = System.nanoTime();
-            migrateFiles(request, remoteFiles, localFiles, job);
+            migrateFiles(request, remoteFiles, localFiles, job, beforeResourceCopy);
             logElapsed(job, currentStage, stageStartedNanos);
 
-            currentStage = "数据库迁移";
+            currentStage = Phase.DATABASE.title();
+            progress.accept(Phase.DATABASE);
             stageStartedNanos = System.nanoTime();
             migrateDatabase(request, job);
             logElapsed(job, currentStage, stageStartedNanos);
             // 先完成通用 V3 表结构升级，再写入通用插件，最后执行依赖 V3/JPA 字段的同步管理专项迁移。
-            currentStage = "V3 通用数据库结构升级";
+            currentStage = Phase.SCHEMA.title();
+            progress.accept(Phase.SCHEMA);
             stageStartedNanos = System.nanoTime();
             targetDatabaseUpgradeService.execute(request.targetDatabase(), job);
             logElapsed(job, currentStage, stageStartedNanos);
-            currentStage = "通用插件迁移";
+            currentStage = Phase.PLUGINS.title();
+            progress.accept(Phase.PLUGINS);
             stageStartedNanos = System.nanoTime();
             String targetInstallPath = request.targetServer().installPath();
             pluginMigrationService.updatePlugins(request.targetDatabase(), targetInstallPath, job);
             logElapsed(job, currentStage, stageStartedNanos);
-            currentStage = "同步管理专项迁移";
+            currentStage = Phase.SYNC.title();
+            progress.accept(Phase.SYNC);
             stageStartedNanos = System.nanoTime();
             syncManagementMigrationService.execute(request.targetDatabase(), targetInstallPath, job);
             logElapsed(job, currentStage, stageStartedNanos);
@@ -185,13 +216,13 @@ public class MigrationService {
     }
 
     private void migrateFiles(MigrationRequest request, String remoteArchive, Path localArchive,
-                              MigrationJob job) throws Exception {
+                              MigrationJob job, BeforeResourceCopy beforeResourceCopy) throws Exception {
         ServerInfo source = request.sourceServer();
         ServerInfo target = request.targetServer();
         validateDependencies(target.installPath());
         boolean copySyncTaskLogs = request.copySyncTaskLogs() || this.copySyncTaskLogs;
         dataEaseVersionValidator.validate(source, job);
-        job.log("开始迁移文件：i18n、font、exportData、map、geo、appearance、static-resource、excel 及插件。");
+        job.log("开始迁移文件：i18n、font、exportData、map、geo、appearance、static-resource 及插件。");
         String sourceDataDirectory = source.installPath() + "/data";
         boolean sourceLocal = isLocalServer(source);
         boolean targetLocal = isLocalServer(target);
@@ -211,6 +242,7 @@ public class MigrationService {
                     + "，耗时：" + formatElapsed(stepStartedNanos) + "。");
         }
 
+        beforeResourceCopy.run();
         if (targetLocal) {
             job.log("目标端地址 " + target.host() + " 属于本机，直接写入本地安装目录，不建立 SSH 连接。");
             stepStartedNanos = System.nanoTime();

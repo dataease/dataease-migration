@@ -46,9 +46,12 @@ public final class MigrationJob {
     }
 
     public void log(String message) {
+        if (listener != null) {
+            listener.accept(message);
+            return;
+        }
         String line = "[" + Instant.now() + "] " + message;
         logs.add(line);
-        if (listener != null) listener.accept(line);
         LOGGER.info(line);
         for (SseEmitter subscriber : subscribers) {
             send(subscriber, "log", line);

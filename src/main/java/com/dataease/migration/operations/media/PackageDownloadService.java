@@ -364,6 +364,17 @@ public final class PackageDownloadService {
     private static String resource(URI uri) {
         String query=Objects.toString(uri.getRawQuery(),"");
         // Known signed URL credentials may rotate while the object key and version remain fixed.
+        if ("https".equals(uri.getScheme()) && "release-assets.githubusercontent.com".equals(uri.getHost())
+                && uri.getRawPath().startsWith("/github-production-release-asset/")
+                && Arrays.stream(query.split("&")).anyMatch(part -> part.startsWith("sig="))) {
+            Set<String> signingFields = Set.of("jwt", "sig", "se", "ske", "skoid", "sks", "skt",
+                    "sktid", "skv", "sp", "spr", "sr", "sv", "rscd", "rsct",
+                    "response-content-disposition", "response-content-type");
+            query = Arrays.stream(query.split("&"))
+                    .filter(part -> !signingFields.contains(part.split("=", 2)[0]))
+                    .collect(java.util.stream.Collectors.joining("&"));
+            return uri.getScheme()+"://"+uri.getRawAuthority()+uri.getRawPath()+"?"+query;
+        }
         Set<String> auth=Set.of("x-amz-algorithm","x-amz-credential","x-amz-date","x-amz-expires","x-amz-signedheaders","x-amz-signature","x-amz-security-token","ossaccesskeyid","expires","signature","security-token");
         boolean signed=query.toLowerCase(Locale.ROOT).contains("x-amz-signature=") || query.toLowerCase(Locale.ROOT).contains("ossaccesskeyid=") && query.toLowerCase(Locale.ROOT).contains("signature=");
         if(signed) query=Arrays.stream(query.split("&")).filter(part->!auth.contains(part.split("=",2)[0].toLowerCase(Locale.ROOT))).collect(java.util.stream.Collectors.joining("&"));

@@ -1,6 +1,7 @@
 package com.dataease.migration.operations.api;
 
 import com.dataease.migration.operations.app.OperationsService;
+import com.dataease.migration.operations.app.PrecheckRuns;
 import com.dataease.migration.operations.auth.OperationsAuthService;
 import com.dataease.migration.operations.core.OperationsApiException;
 import com.dataease.migration.operations.media.ArchiveSupport;
@@ -37,15 +38,17 @@ import java.util.concurrent.Semaphore;
 public final class OperationsController {
     private final OperationsService operations;
     private final OperationsAuthService authentication;
+    private final PrecheckRuns prechecks;
     private final ConcurrentHashMap<String, Download> exports = new ConcurrentHashMap<>();
     private final Semaphore exportSlots = new Semaphore(4);
 
     private record Download(Path file, String owner, Instant expires) {}
 
     public OperationsController(
-            OperationsService operations, OperationsAuthService authentication) {
+            OperationsService operations, OperationsAuthService authentication, PrecheckRuns prechecks) {
         this.operations = operations;
         this.authentication = authentication;
+        this.prechecks = prechecks;
     }
 
     @GetMapping("/state")
@@ -81,6 +84,30 @@ public final class OperationsController {
         return ResponseEntity.accepted().body(operations.service(id, input));
     }
 
+    @PostMapping("/instances/{id}/open-access")
+    public ResponseEntity<Map<String, Object>> openAccess(
+            @PathVariable String id, @RequestBody Map<String, Object> input) {
+        return ResponseEntity.accepted().body(operations.openAccess(id, input));
+    }
+
+    @PostMapping("/instances/{id}/uninstall")
+    public ResponseEntity<Map<String, Object>> uninstall(@PathVariable String id,
+            @RequestBody Map<String, Object> input, HttpServletRequest request) throws Exception {
+        authentication.requirePassword(adminPassword(input), request);
+        return ResponseEntity.accepted().body(operations.uninstall(id));
+    }
+
+    @PostMapping("/instances/{id}/initial-admin")
+    public ResponseEntity<Map<String, String>> initialAdmin(@PathVariable String id,
+            @RequestBody Map<String, Object> input, HttpServletRequest request) throws Exception {
+        authentication.requirePassword(adminPassword(input), request);
+        return ResponseEntity.ok().header(HttpHeaders.CACHE_CONTROL, "no-store").body(operations.initialAdmin(id));
+    }
+
+    private static String adminPassword(Map<String, Object> input) {
+        return input.get("password") instanceof String password ? password : "";
+    }
+
     @GetMapping("/instances/{id}/automation")
     public Map<String, Object> automation(@PathVariable String id) throws Exception {
         return operations.automation(id);
@@ -89,6 +116,27 @@ public final class OperationsController {
     @PostMapping("/prechecks")
     public Map<String, Object> precheck(@RequestBody Map<String, Object> input) throws Exception {
         return operations.precheck(input);
+    }
+
+    @PostMapping("/precheck-runs")
+    public ResponseEntity<Map<String, Object>> startPrecheck(
+            @RequestBody Map<String, Object> input, HttpServletRequest request) {
+        return ResponseEntity.accepted().header(HttpHeaders.CACHE_CONTROL, "no-store")
+                .body(prechecks.start(sessionOwner(request), input));
+    }
+
+    @PostMapping("/task-submissions")
+    public ResponseEntity<Map<String, Object>> startTaskSubmission(
+            @RequestBody Map<String, Object> input, HttpServletRequest request) {
+        return ResponseEntity.accepted().header(HttpHeaders.CACHE_CONTROL, "no-store")
+                .body(prechecks.start(sessionOwner(request), input, true));
+    }
+
+    @GetMapping({"/precheck-runs/{id}", "/task-submissions/{id}"})
+    public ResponseEntity<Map<String, Object>> precheckProgress(
+            @PathVariable String id, HttpServletRequest request) {
+        return ResponseEntity.ok().header(HttpHeaders.CACHE_CONTROL, "no-store")
+                .body(prechecks.snapshot(sessionOwner(request), id));
     }
 
     @PostMapping("/tasks")
@@ -131,8 +179,9 @@ public final class OperationsController {
     }
 
     @PostMapping("/tasks/{id}/acceptance/complete")
-    public Map<String, Object> completeAcceptance(@PathVariable String id) throws Exception {
-        return operations.finishAcceptance(id);
+    public Map<String, Object> completeAcceptance(@PathVariable String id,
+            @RequestBody(required = false) Map<String, Object> input) {
+        return operations.finishAcceptance(id, input == null || input.isEmpty() ? null : input);
     }
 
     @PostMapping(value = "/packages", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
@@ -155,6 +204,12 @@ public final class OperationsController {
     public Map<String, Object> manifest(
             @PathVariable String id, @RequestBody Map<String, Object> manifest) throws Exception {
         return operations.attachManifest(id, manifest);
+    }
+
+    @PutMapping("/packages/{id}/upgrade-compatibility")
+    public Map<String, Object> upgradeCompatibility(@PathVariable String id,
+            @RequestBody Map<String, Object> declaration) throws Exception {
+        return operations.declareUpgradeCompatibility(id, declaration);
     }
 
     @DeleteMapping("/packages/{id}")
@@ -197,7 +252,7 @@ public final class OperationsController {
         char[] password = supplied == null ? new char[0] : supplied.toCharArray();
         Path file = null;
         try {
-            String owner = exportOwner(request);
+            String owner = sessionOwner(request);
             file = operations.exportBackup(id, password);
             String ticket = UUID.randomUUID().toString();
             Instant expires = Instant.now().plusSeconds(600);
@@ -233,7 +288,7 @@ public final class OperationsController {
             cleanupExports();
             throw new OperationsApiException(HttpStatus.GONE, "下载链接已失效，请重新导出备份。");
         }
-        if (!download.owner().equals(exportOwner(request)))
+        if (!download.owner().equals(sessionOwner(request)))
             throw new OperationsApiException(HttpStatus.FORBIDDEN, "请使用发起导出的管理员会话下载。");
         if (!exports.remove(ticket, download))
             throw new OperationsApiException(HttpStatus.GONE, "该导出包已开始下载，请重新导出后再次下载。");
@@ -280,7 +335,7 @@ public final class OperationsController {
         }
     }
 
-    private String exportOwner(HttpServletRequest request) {
+    private String sessionOwner(HttpServletRequest request) {
         return authentication
                 .session(request)
                 .orElseThrow(() -> new OperationsApiException(HttpStatus.UNAUTHORIZED, "请先登录管理员账号"))

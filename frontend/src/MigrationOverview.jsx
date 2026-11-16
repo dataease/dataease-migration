@@ -5,15 +5,15 @@ import "./migration-overview.css";
 
 const sections = ["迁移范围", "开始前确认"];
 const scope = [
-  ["database", "元数据库与业务配置", "表结构、数据和权限配置"],
-  ["folder", "文件与资源", "上传文件、地图、字体和外观"],
+  ["database", "元数据库与业务配置", "表结构、权限配置和 Excel 已导入数据"],
+  ["folder", "文件与资源", "地图、字体和外观等资源"],
   ["settings", "插件与同步管理", "转换支持的插件与同步任务，历史日志可选"],
 ];
 const prerequisites = [
-  "选择已安装的 V3 目标实例",
+  "选择已有 V3，或用离线包同机新建 V3",
   "核对数据库、目录和容器归属",
   "确认两端停服影响与目标覆盖范围",
-  "平台先停服和保护备份，再执行迁移",
+  "迁移写入前，平台校验两端的保护备份",
 ];
 
 export default function MigrationOverview({ onStart }) {

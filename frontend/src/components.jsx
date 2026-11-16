@@ -7,15 +7,103 @@ export const tone = (value) =>
     ? "red"
     : ["待验收", "关注", "待校验", "状态待确认", "warning"].includes(value)
       ? "amber"
-      : ["执行中", "排队中", "running"].includes(value)
+      : ["执行中", "排队中", "终止中", "核查中", "running"].includes(value)
         ? "blue"
-        : ["已停止", "未知", "未检查", "待检查", "interrupted"].includes(value)
+        : ["已停止", "未安装", "未知", "未检查", "待检查", "interrupted"].includes(value)
           ? "gray"
           : "green";
 export const backupLocation = (backup) =>
   backup.storageHost === "operations-platform"
     ? "运维平台备份库"
     : backup.storageLabel || backup.destination || "副本位置未记录";
+
+export const taskInProgress = (task) =>
+  ["排队中", "执行中", "终止中", "核查中"].includes(task.status);
+
+export function taskActivity(task) {
+  if (task.state === "queued") return { title: "等待执行", since: task.createdAt, waiting: true };
+  if (task.state === "aborting") return { title: "停止目标并结束验收", since: task.activityStartedAt };
+  if (task.state === "reconciling") return { title: "核查目标运行状态", since: task.reconciliation?.confirmedAt };
+  const stage = task.stages?.find((item) => item.title === task.currentStage);
+  if (task.currentCheck) return {
+    title: `检查 ${task.currentCheck}`,
+    since: task.currentCheckStartedAt || stage?.startedAt,
+  };
+  if (stage?.status === "running") return {
+    title: stage.title,
+    since: stage.startedAt,
+    detail: task.stageActivity || stage.detail,
+  };
+  if (stage?.status === "passed") return { title: `已完成 ${stage.title}` };
+  return { title: "准备执行", since: task.startedAt || task.createdAt };
+}
+
+export function Elapsed({ since, label = "已用" }) {
+  const [now, setNow] = useState(Date.now);
+  const start = Date.parse(since);
+  useEffect(() => {
+    if (!Number.isFinite(start)) return;
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [start]);
+  if (!Number.isFinite(start)) return null;
+  const seconds = Math.max(0, Math.floor((now - start) / 1000));
+  const minutes = Math.floor(seconds / 60);
+  const clock = minutes >= 60
+    ? [Math.floor(minutes / 60), minutes % 60, seconds % 60]
+    : [minutes, seconds % 60];
+  return (
+    <span className="activity-elapsed" aria-live="off">
+      {label} {clock.map((part) => String(part).padStart(2, "0")).join(":")}
+    </span>
+  );
+}
+
+export function SubmissionProgress({ progress, onAction }) {
+  const region = useRef(null);
+  useEffect(() => {
+    region.current?.scrollIntoView({ block: "nearest" });
+  }, []);
+  if (!progress) return null;
+  const { state, current, submission, startedAt } = progress;
+  const active = ["requesting", "queued", "running", "submitting", "reconnecting"].includes(state);
+  const checks = submission?.checks ?? progress.checks ?? [];
+  const visibleChecks = submission?.passed === false ? [...checks].sort(
+    (first, second) => Number(second.status === "blocked") - Number(first.status === "blocked"),
+  ) : checks;
+  const label = {
+    requesting: "正在提交请求",
+    queued: "等待检查",
+    running: current ? `正在检查：${current}` : "正在检查执行条件",
+    submitting: "检查通过，正在创建任务",
+    reconnecting: "正在重新获取任务状态",
+    completed: submission?.passed ? "任务已创建" : "检查未通过，操作未执行",
+    failed: "提交未完成",
+  }[state];
+  return (
+    <section ref={region} className="submission-progress" aria-label="执行条件检查">
+      <div className="wf-check-progress">
+        <strong role="status">
+          {active && <span className="task-spinner" aria-hidden="true" />}
+          {label}
+        </strong>
+        {active && <Elapsed since={startedAt} />}
+      </div>
+      {visibleChecks.length > 0 && <CheckResults checks={visibleChecks} onAction={active ? undefined : onAction} />}
+    </section>
+  );
+}
+
+function DialogActivity({ children }) {
+  const [started] = useState(() => new Date().toISOString());
+  return (
+    <span className="dialog-activity">
+      <span role="status"><span className="task-spinner" aria-hidden="true" />{children}</span>
+      <Elapsed since={started} />
+    </span>
+  );
+}
+
 export function Field({ label, children, hint, ...props }) {
   const hintId = useId();
   const accessibility = {
@@ -80,6 +168,8 @@ export function Modal({
   actions,
   wide = true,
   busy = false,
+  busyLabel = "正在处理",
+  className = "",
 }) {
   const close = () => {
     if (!busy) onClose();
@@ -92,7 +182,7 @@ export function Modal({
       onMouseDown={(event) => event.target === event.currentTarget && close()}
     >
       <section
-        className={`ap-dialog ${wide ? "wide" : ""}`}
+        className={`ap-dialog ${wide ? "wide" : ""} ${className}`}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
@@ -116,6 +206,7 @@ export function Modal({
           </fieldset>
         </div>
         <footer className="ap-dialog-footer">
+          {busy && busyLabel && <DialogActivity>{busyLabel}</DialogActivity>}
           {actions || <Button onClick={onClose}>关闭</Button>}
         </footer>
       </section>
@@ -134,6 +225,7 @@ export function WizardFrame({
   nextLabel,
   nextDisabled,
   busy,
+  busyLabel = "正在处理",
   error,
 }) {
   const close = () => {
@@ -184,7 +276,7 @@ export function WizardFrame({
           </strong>
         </div>
         <div className="wf-body">
-          <aside className="wf-steps">
+          {steps.length > 1 && <aside className="wf-steps">
             {steps.map((label, index) => (
               <div
                 key={label}
@@ -198,7 +290,7 @@ export function WizardFrame({
                 </div>
               </div>
             ))}
-          </aside>
+          </aside>}
           <div className="wf-content" ref={content} onFocus={revealFocusedControl}>
             <fieldset className="dialog-fields" disabled={busy}>
               {children}
@@ -208,16 +300,15 @@ export function WizardFrame({
         </div>
         <footer className="wf-footer">
           <span className="wf-footnote">
-            {steps.length === 1
-              ? "只读检查 · 不修改实例"
-              : `第 ${step + 1} 步，共 ${steps.length} 步`}
+            {busy ? busyLabel && <DialogActivity>{busyLabel}</DialogActivity> : steps.length > 1
+              ? `第 ${step + 1} 步，共 ${steps.length} 步` : null}
           </span>
           <div className="wf-footer-actions">
             <Button disabled={busy} onClick={step ? onBack : onClose}>
               {step ? "上一步" : "取消"}
             </Button>
             <Button primary disabled={busy || nextDisabled} onClick={onNext}>
-              {busy ? "正在处理…" : nextLabel || "下一步"}
+              {nextLabel || "下一步"}
             </Button>
           </div>
         </footer>
@@ -323,7 +414,7 @@ export function CredentialFields({
             label="SSH 主机指纹"
             value={value.hostKey || ""}
             onChange={(event) => change("hostKey", event.target.value)}
-            hint="首次连接请与服务器管理员核对指纹；已保存连接会校验固定主机密钥。"
+            hint={value.sshAuth === "key" ? "选填。留空时记录首次成功连接的主机指纹，后续自动核对。" : "首次使用密码连接时请核对主机指纹。"}
           />
         </>
       )}
@@ -337,29 +428,35 @@ export function DatabaseFields({
   types = ["MySQL"],
   supportedTypes,
   password = true,
+  fixedType = false,
 }) {
   const set = (key, item) => onChange({ ...value, [key]: item });
   return (
     <div className="form-grid">
-      <Field label="数据库类型">
-        <Select
-          aria-label="数据库类型"
-          value={value.dbType || "MySQL"}
-          onChange={(event) => set("dbType", event.target.value)}
-        >
-          {types.map((type) => (
-            <option
-              key={type}
-              disabled={supportedTypes && !supportedTypes.includes(type)}
-            >
-              {type}
-              {supportedTypes && !supportedTypes.includes(type)
-                ? "（暂不支持自动部署）"
-                : ""}
-            </option>
-          ))}
-        </Select>
-      </Field>
+      {fixedType ? (
+        <Field label="数据库类型" value="MySQL" readOnly />
+      ) : (
+        <Field label="数据库类型">
+          <Select
+            aria-label="数据库类型"
+            value={value.dbType || "MySQL"}
+            onChange={(event) => set("dbType", event.target.value)}
+          >
+            {types.map((type) => (
+              <option
+                key={type}
+                value={type}
+                disabled={supportedTypes && !supportedTypes.includes(type)}
+              >
+                {type}
+                {supportedTypes && !supportedTypes.includes(type)
+                  ? "（暂不支持自动部署）"
+                  : ""}
+              </option>
+            ))}
+          </Select>
+        </Field>
+      )}
       <Field
         label="数据库名称"
         value={value.dbName || ""}
@@ -394,6 +491,7 @@ export function DatabaseFields({
   );
 }
 export function Endpoint({ instance, label, onManage }) {
+  const uninstalled = instance?.status === "未安装";
   return (
     <section className="migration-connection-card">
       <div className="migration-connection-heading">
@@ -405,15 +503,22 @@ export function Endpoint({ instance, label, onManage }) {
       <dl>
         <dt>服务器</dt>
         <dd>{instance?.host}</dd>
-        <dt>版本</dt>
-        <dd>{instance?.version}</dd>
-        <dt>安装目录</dt>
-        <dd>{instance?.path}</dd>
-        <dt>元数据库</dt>
-        <dd>
-          {instance?.dbType} · {instance?.dbHost}:{instance?.dbPort} /{" "}
-          {instance?.dbName}
-        </dd>
+        {uninstalled ? <>
+          <dt>架构</dt>
+          <dd>{instance.arch}</dd>
+          <dt>状态</dt>
+          <dd>{instance.status}</dd>
+        </> : <>
+          <dt>版本</dt>
+          <dd>{instance?.version}</dd>
+          <dt>安装目录</dt>
+          <dd>{instance?.path}</dd>
+          <dt>元数据库</dt>
+          <dd>
+            {instance?.dbType} · {instance?.dbHost}:{instance?.dbPort} /{" "}
+            {instance?.dbName}
+          </dd>
+        </>}
       </dl>
       {onManage && (
         <div className="migration-connection-footer">
@@ -502,11 +607,12 @@ export function CheckResults({
             />
             <div>
               <strong>{check.title || check.name}</strong>
-              <p>{check.remediation?.hint || check.detail || check.message}</p>
+              {(check.detail || check.message || check.remediation?.hint) &&
+                <p>{check.detail || check.message || check.remediation?.hint}</p>}
               {check.remediation?.hint && (check.detail || check.message) && (
                 <details className="check-technical">
-                  <summary>技术详情</summary>
-                  <p>{check.detail || check.message}</p>
+                  <summary>处理建议</summary>
+                  <p>{check.remediation.hint}</p>
                 </details>
               )}
               {onAction &&

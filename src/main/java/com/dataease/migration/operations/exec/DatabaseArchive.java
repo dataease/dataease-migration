@@ -2,12 +2,15 @@ package com.dataease.migration.operations.exec;
 
 import static com.dataease.migration.operations.exec.HostCommands.text;
 
+import com.dataease.migration.service.SshCommandExecutor;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import org.springframework.stereotype.Component;
 
 import java.io.*;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.sql.*;
@@ -18,27 +21,73 @@ import java.util.function.Consumer;
 @Component
 public class DatabaseArchive {
     private final ObjectMapper json;
+    private final HostCommands host;
+    private final ComposeManager compose;
 
-    public DatabaseArchive(ObjectMapper json) {
+    public DatabaseArchive(ObjectMapper json, HostCommands host, ComposeManager compose) {
         this.json = json;
+        this.host = host;
+        this.compose = compose;
     }
 
-    public static Connection connect(Map<String, Object> i, Map<String, String> c)
+    public Connection connect(Map<String, Object> i, Map<String, String> c)
             throws SQLException {
         return connect(i, c, true);
     }
 
-    public static Connection connectServer(Map<String, Object> i, Map<String, String> c)
+    public Connection connectServer(Map<String, Object> i, Map<String, String> c)
             throws SQLException {
         return connect(i, c, false);
     }
 
-    private static Connection connect(Map<String, Object> i, Map<String, String> c, boolean selectDatabase)
+    record Route(Map<String, Object> instance, SshCommandExecutor.LocalForward forward)
+            implements AutoCloseable {
+        @Override public void close() { if (forward != null) forward.close(); }
+    }
+
+    Route route(Map<String, Object> instance, Map<String, String> credentials) throws SQLException {
+        if (!ComposeManager.isVendorEnterprise(instance)) return new Route(instance, null);
+        try {
+            String destination = compose.privateMysqlAddress(instance, credentials);
+            var forward = host.forwardDatabase(instance, credentials, destination);
+            Map<String, Object> local = new LinkedHashMap<>(instance);
+            local.put("dbHost", "127.0.0.1");
+            local.put("dbPort", forward.port());
+            return new Route(local, forward);
+        } catch (Exception failure) {
+            if (failure instanceof InterruptedException) Thread.currentThread().interrupt();
+            throw new SQLException("无法通过 SSH 访问受管的内置 MySQL，请核对容器状态与 SSH 转发权限。", failure);
+        }
+    }
+
+    private Connection connect(Map<String, Object> i, Map<String, String> c, boolean selectDatabase)
             throws SQLException {
         if (!text(i, "dbType", "MySQL").equals("MySQL"))
             throw new IllegalArgumentException("首版自动数据备份仅支持MySQL");
         String name = text(i, "dbName", "");
         if (!name.matches("[A-Za-z0-9_.$-]+")) throw new IllegalArgumentException("数据库名称无效");
+        Route route = route(i, c);
+        try {
+            Connection connection = connectDirect(route.instance(), c, selectDatabase ? name : "");
+            if (route.forward() == null) return connection;
+            return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(),
+                    new Class<?>[] {Connection.class}, (proxy, method, args) -> {
+                        try {
+                            return method.invoke(connection, args);
+                        } catch (InvocationTargetException error) {
+                            throw error.getCause();
+                        } finally {
+                            if ("close".equals(method.getName()) || "abort".equals(method.getName())) route.close();
+                        }
+                    });
+        } catch (SQLException | RuntimeException failure) {
+            route.close();
+            throw failure;
+        }
+    }
+
+    private static Connection connectDirect(Map<String, Object> i, Map<String, String> c, String name)
+            throws SQLException {
         String dbHost = text(i, "dbHost", text(i, "host", ""));
         if (dbHost.contains(":")) dbHost = "[" + dbHost + "]";
         String url =
@@ -47,7 +96,7 @@ public class DatabaseArchive {
                         + ":"
                         + text(i, "dbPort", "3306")
                         + "/"
-                        + (selectDatabase ? name : "")
+                        + name
                         + "?useUnicode=true&characterEncoding=UTF-8&connectTimeout=15000&socketTimeout=600000&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC&tinyInt1isBit=false";
         return DriverManager.getConnection(
                 url,
@@ -58,7 +107,7 @@ public class DatabaseArchive {
     public record DatabaseState(String identity, boolean present) {}
 
     /** Observe the managed server without requiring a database that a failed DROP may have removed. */
-    public static DatabaseState observe(Map<String, Object> instance, Map<String, String> credentials)
+    public DatabaseState observe(Map<String, Object> instance, Map<String, String> credentials)
             throws SQLException {
         try (Connection connection = connectServer(instance, credentials);
                 Statement query = connection.createStatement()) {

@@ -18,14 +18,15 @@ final class PluginInstaller {
     private final HostCommands host;
     private final MediaService media;
     private final ObjectMapper json;
+    private final DatabaseArchive database;
     private final ComposeManager compose;
 
     PluginInstaller(
-            HostCommands host, ComposeManager compose, MediaService media, ObjectMapper json) {
+            HostCommands host, ComposeManager compose, MediaService media, ObjectMapper json, DatabaseArchive database) {
         this.host = host;
         this.compose = compose;
         this.media = media;
-        this.json = json;
+        this.json = json; this.database = database;
     }
 
     void precheck(
@@ -36,13 +37,14 @@ final class PluginInstaller {
             String prefix)
             throws Exception {
         Map<String, Object> verified = compatible(plugin, i);
-        token(operationCredentials);
         prefix(prefix);
         if (registered(i, c, text(verified, "module", "")) != null)
             throw new IllegalArgumentException("此模块已在目标登记；请使用DataEase自身的插件更新流程");
         try (var transport = new ContainerApplicationHttp(host, compose, i, c)) {
+            String session = session(transport, prefix, operationCredentials);
+            requireLicense(transport, prefix, session);
             JsonNode rows =
-                    request(transport, prefix, "/plugin/query", operationCredentials, null, null);
+                    request(transport, prefix, "/plugin/query", session, null, null);
             if (!rows.isArray()) throw new IllegalArgumentException("目标插件查询接口返回格式不受支持");
         }
     }
@@ -53,6 +55,7 @@ final class PluginInstaller {
             Map<String, String> c,
             Map<String, String> operationCredentials,
             String prefix,
+            Runnable beforeWrite,
             Consumer<String> log)
             throws Exception {
         Map<String, Object> verified = compatible(plugin, i);
@@ -68,19 +71,23 @@ final class PluginInstaller {
         boolean submitted = false;
         try (var transport = new ContainerApplicationHttp(host, compose, i, c)) {
             long deadline = System.nanoTime() + Duration.ofMinutes(3).toNanos();
+            String session;
             while (true) {
                 try {
-                    request(transport, prefix, "/plugin/query", operationCredentials, null, null);
+                    session = session(transport, prefix, operationCredentials);
+                    requireLicense(transport, prefix, session);
+                    request(transport, prefix, "/plugin/query", session, null, null);
                     break;
                 } catch (SocketException | ApiUnavailable unavailable) {
                     if (System.nanoTime() >= deadline) throw unavailable;
                     Thread.sleep(1000);
                 }
             }
+            beforeWrite.run();
             submitted = true;
-            request(transport, prefix, "/plugin/install", operationCredentials, jar, filename);
+            request(transport, prefix, "/plugin/install", session, jar, filename);
             JsonNode rows =
-                    request(transport, prefix, "/plugin/query", operationCredentials, null, null);
+                    request(transport, prefix, "/plugin/query", session, null, null);
             Map<String, Object> record = registered(i, c, module);
             if (record == null
                     || !version.equals(record.get("version"))
@@ -123,6 +130,20 @@ final class PluginInstaller {
                 true);
     }
 
+    private String session(ContainerApplicationHttp transport, String prefix,
+            Map<String, String> credentials) throws Exception {
+        String password = credentials.getOrDefault("dataeaseAdminPassword", "");
+        if (password.isBlank() || password.length() > 256)
+            throw new IllegalArgumentException("请输入目标 DataEase 的 admin 密码。");
+        try {
+            return ExecutionService.adminSession(transport, json, prefix(prefix), password);
+        } catch (SocketException unavailable) {
+            throw unavailable;
+        } catch (Exception rejected) {
+            throw new IllegalArgumentException("无法登录目标 DataEase，请核对 admin 密码、API 前缀和本地登录设置。");
+        }
+    }
+
     private Map<String, Object> compatible(Map<String, Object> plugin, Map<String, Object> i)
             throws Exception {
         Map<String, Object> verified = media.verify(plugin);
@@ -147,12 +168,12 @@ final class PluginInstaller {
             ContainerApplicationHttp transport,
             String prefix,
             String route,
-            Map<String, String> credentials,
+            String token,
             Path upload,
             String filename)
             throws Exception {
         var response =
-                transport.request(prefix(prefix) + route, token(credentials), upload, filename);
+                transport.request(prefix(prefix) + route, token, upload, filename);
         if (upload == null && Set.of(502, 503).contains(response.status()))
             throw new ApiUnavailable();
         if (response.status() < 200 || response.status() >= 300)
@@ -174,9 +195,29 @@ final class PluginInstaller {
         return result;
     }
 
+    private void requireLicense(ContainerApplicationHttp transport, String prefix,
+            String token) throws Exception {
+        var response = transport.validateLicense(prefix(prefix), token);
+        if (Set.of(502, 503).contains(response.status())) throw new ApiUnavailable();
+        if (response.status() == 401 || response.status() == 403)
+            throw new IllegalArgumentException("请提供目标 DataEase 管理员的有效会话令牌。");
+        if (response.status() != 200)
+            throw new IllegalArgumentException("无法读取 DataEase 企业授权状态，请核对 API 前缀及实例运行状态。");
+        var body = json.readTree(response.body());
+        if (body == null || !body.isObject())
+            throw new IllegalArgumentException("DataEase 授权检查未返回有效状态。");
+        if (body.has("code")) {
+            if (!Set.of(0, 200).contains(body.path("code").asInt(-1)))
+                throw new IllegalArgumentException("DataEase 未授权读取企业授权状态，请核对管理员会话令牌。");
+            body = body.path("data");
+        }
+        if (!"valid".equals(body.path("status").asText()))
+            throw new IllegalArgumentException("目标 DataEase 缺少有效企业授权。请在 DataEase 更新授权后重试。");
+    }
+
     private Map<String, Object> registered(
             Map<String, Object> i, Map<String, String> c, String module) throws Exception {
-        try (Connection connection = DatabaseArchive.connect(i, c);
+        try (Connection connection = database.connect(i, c);
                 PreparedStatement statement =
                         connection.prepareStatement(
                                 "SELECT id,version,flag,jar_name FROM xpack_plugin WHERE"
@@ -199,15 +240,6 @@ final class PluginInstaller {
                 return record;
             }
         }
-    }
-
-    private static String token(Map<String, String> c) {
-        String token = c.getOrDefault("dataeaseToken", "");
-        if (token.isBlank()
-                || token.length() > 16384
-                || token.chars().anyMatch(Character::isISOControl))
-            throw new IllegalArgumentException("请提供目标DataEase管理员的有效会话令牌");
-        return token;
     }
 
     private static String prefix(String value) {

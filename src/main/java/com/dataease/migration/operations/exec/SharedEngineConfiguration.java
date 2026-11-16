@@ -6,7 +6,6 @@ import com.dataease.migration.model.DatabaseConnection;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.sql.*;
 import java.util.*;
@@ -14,15 +13,18 @@ import javax.crypto.Cipher;
 import javax.crypto.spec.IvParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 
-/** Relocates managed connections and local Excel files; external business connections stay intact. */
+/** Relocates managed connections and checks Excel tables in the shared engine. */
 final class SharedEngineConfiguration {
     private final ObjectMapper json;
+    private final DatabaseArchive database;
 
-    SharedEngineConfiguration(ObjectMapper json) { this.json = json; }
+    record ExcelTables(Map<Long, Set<String>> references, Map<String, Long> counts) {}
+
+    SharedEngineConfiguration(ObjectMapper json, DatabaseArchive database) { this.json = json; this.database = database; }
 
     boolean verify(Map<String, Object> instance, Map<String, String> credentials) throws Exception {
         DatabaseConnection route = route(credentials);
-        try (Connection connection = DatabaseArchive.connect(instance, credentials)) {
+        try (Connection connection = database.connect(instance, credentials)) {
             Codec codec = codec(connection);
             try (Statement query = connection.createStatement();
                     ResultSet rows = query.executeQuery("SELECT type,configuration FROM core_de_engine")) {
@@ -39,66 +41,96 @@ final class SharedEngineConfiguration {
 
     void relocate(Map<String, Object> source, Map<String, String> sc,
             Map<String, Object> target, Map<String, String> tc) throws Exception {
-        relocate(route(sc), target, tc);
+        relocate(route(sc), target, tc, true);
     }
 
-    void validateExcelFiles(Map<String, Object> source, Map<String, String> credentials,
-            HostCommands host) throws Exception {
-        excelFiles(source, credentials, host, false);
+    Map<Long, Set<String>> validateExcelTables(Map<String, Object> instance, Map<String, String> credentials)
+            throws Exception {
+        try (Connection connection = database.connect(instance, credentials)) {
+            return validateExcelTables(connection);
+        }
     }
 
-    void relocateExcelFiles(Map<String, Object> target, Map<String, String> credentials,
-            HostCommands host) throws Exception {
-        excelFiles(target, credentials, host, true);
+    ExcelTables snapshotExcelTables(Map<String, Object> instance, Map<String, String> credentials)
+            throws Exception {
+        return readExcelTables(instance, credentials, true);
     }
 
-    private void excelFiles(Map<String, Object> instance, Map<String, String> credentials,
-            HostCommands host, boolean relocate) throws Exception {
-        String oldRoot = "/opt/dataease2.0/data/excel/", newRoot = "/opt/dataease3.0/data/excel/";
-        try (Connection connection = DatabaseArchive.connect(instance, credentials)) {
-            Codec codec = codec(connection);
-            List<Map.Entry<Long, String>> updates = new ArrayList<>();
-            try (Statement query = connection.createStatement();
-                    ResultSet rows = query.executeQuery("SELECT id,configuration FROM core_datasource WHERE type='Excel'")) {
-                while (rows.next()) {
-                    var sheets = decodeJson(rows.getString(2), codec);
-                    if (!sheets.isArray() || sheets.isEmpty())
-                        throw new IllegalArgumentException("本地Excel配置无法识别，不能确认原文件迁移范围");
-                    for (var sheet : sheets) {
-                        String file = sheet.path("path").asText("");
-                        if (!sheet.isObject() || !file.startsWith(oldRoot)
-                                || file.length() == oldRoot.length()
-                                || file.contains("\\") || file.chars().anyMatch(Character::isISOControl)
-                                || !Path.of(file).normalize().toString().equals(file))
-                            throw new IllegalArgumentException("本地Excel原文件不在受管V2目录内，已阻止迁移");
-                        String relative = file.substring(oldRoot.length());
-                        String actual = path(text(instance, "path", "")) + "/data/excel/" + relative;
-                        try {
-                            host.run(instance, credentials, "test -f " + quote(actual)
-                                    + " && test -r " + quote(actual)
-                                    + " && test ! -L " + quote(actual), line -> {});
-                        } catch (Exception missing) {
-                            throw new IllegalArgumentException("本地Excel原文件缺失或不可读，已阻止迁移", missing);
-                        }
-                        if (relocate) ((com.fasterxml.jackson.databind.node.ObjectNode) sheet)
-                                .put("path", newRoot + relative);
+    Map<String, Long> excelSampleSizes(Map<String, Object> instance, Map<String, String> credentials)
+            throws Exception {
+        return readExcelTables(instance, credentials, false).counts();
+    }
+
+    private ExcelTables readExcelTables(Map<String, Object> instance, Map<String, String> credentials,
+            boolean countAll) throws Exception {
+        try (Connection connection = database.connect(instance, credentials);
+                Statement query = connection.createStatement()) {
+            query.setQueryTimeout(60);
+            Map<Long, Set<String>> references = validateExcelTables(connection);
+            Map<String, Long> counts = new LinkedHashMap<>();
+            for (Set<String> tables : references.values())
+                for (String table : tables) {
+                    if (counts.containsKey(table)) continue;
+                    String name = DatabaseArchive.identifier(table);
+                    String sql = countAll ? "SELECT COUNT(*) FROM " + name
+                            : "SELECT EXISTS(SELECT 1 FROM " + name + " LIMIT 1)";
+                    try (ResultSet rows = query.executeQuery(sql)) {
+                        if (!rows.next()) throw new IllegalStateException("无法读取 Excel 引擎表的行数。");
+                        counts.put(table, rows.getLong(1));
                     }
-                    if (relocate) updates.add(Map.entry(rows.getLong(1), encode(sheets, codec)));
                 }
-            }
-            if (!relocate) return;
-            connection.setAutoCommit(false);
-            try (PreparedStatement update = connection.prepareStatement(
-                    "UPDATE core_datasource SET configuration=? WHERE id=? AND type='Excel'")) {
-                for (var value : updates) {
-                    update.setString(1, value.getValue()); update.setLong(2, value.getKey());
-                    if (update.executeUpdate() != 1) throw new SQLException("迁入Excel配置已变化");
+            return new ExcelTables(references, counts);
+        }
+    }
+
+    private Map<Long, Set<String>> validateExcelTables(Connection connection) throws Exception {
+        Set<String> engineTables = new HashSet<>();
+        try (Statement query = connection.createStatement();
+                ResultSet rows = query.executeQuery(
+                        "SELECT TABLE_NAME FROM information_schema.TABLES "
+                                + "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_TYPE='BASE TABLE'")) {
+            while (rows.next()) engineTables.add(rows.getString(1));
+        }
+
+        Codec codec = null;
+        Map<Long, Set<String>> references = new LinkedHashMap<>();
+        try (Statement query = connection.createStatement();
+                ResultSet rows = query.executeQuery(
+                        "SELECT id,name,configuration FROM core_datasource WHERE type='Excel' ORDER BY id")) {
+            while (rows.next()) {
+                if (codec == null) codec = codec(connection);
+                long id = rows.getLong(1);
+                String source = "Excel 数据源「" + displayName(rows.getString(2)) + "」（ID " + id + "）";
+                com.fasterxml.jackson.databind.JsonNode sheets;
+                try {
+                    sheets = decodeJson(rows.getString(3), codec);
+                } catch (Exception invalid) {
+                    throw new IllegalArgumentException(source + "的工作表配置无法读取，请在 DataEase 中核对。", invalid);
                 }
-                connection.commit();
-            } catch (Exception failure) {
-                connection.rollback(); throw failure;
+                if (sheets == null || !sheets.isArray() || sheets.isEmpty())
+                    throw new IllegalArgumentException(source + "没有可识别的工作表，请在 DataEase 中核对。");
+
+                Set<String> tables = new LinkedHashSet<>();
+                for (var sheet : sheets) {
+                    String table = sheet.path("deTableName").asText("");
+                    if (table.isBlank())
+                        throw new IllegalArgumentException(source + "未记录已导入的数据表，请在 DataEase 中核对。");
+                    if (!engineTables.contains(table))
+                        throw new IllegalArgumentException(source + "的引擎表「" + displayName(table)
+                                + "」不存在，请在 DataEase 中核对数据源及导入结果。");
+                    tables.add(table);
+                }
+                references.put(id, tables);
             }
         }
+        return references;
+    }
+
+    private static String displayName(String value) {
+        if (value == null || value.isBlank()) return "未命名";
+        String safe = value.replaceAll("[\\p{Cc}\\p{Cf}]", " ").replace('\\', '/');
+        safe = safe.substring(safe.lastIndexOf('/') + 1);
+        return safe.substring(0, Math.min(safe.length(), 120));
     }
 
     /** Store the route only; application credentials stay out of the backup manifest. */
@@ -127,11 +159,16 @@ final class SharedEngineConfiguration {
 
     void relocate(DatabaseConnection previous, Map<String, Object> target,
             Map<String, String> tc) throws Exception {
+        relocate(previous, target, tc, false);
+    }
+
+    private void relocate(DatabaseConnection previous, Map<String, Object> target,
+            Map<String, String> tc, boolean versionMigration) throws Exception {
         DatabaseConnection next = route(tc);
         if (tc.getOrDefault("runtimeDbUser", "").isBlank()
                 || tc.getOrDefault("runtimeDbPassword", "").isBlank())
             throw new IllegalArgumentException("缺少目标应用实际数据库凭据，不能重绑定受管引擎");
-        try (Connection connection = DatabaseArchive.connect(target, tc)) {
+        try (Connection connection = database.connect(target, tc)) {
             Codec codec = codec(connection);
             connection.setAutoCommit(false);
             try {
@@ -142,7 +179,8 @@ final class SharedEngineConfiguration {
                         Map<String, Object> config = decode(rows.getString(3), codec);
                         if (!"mysql".equalsIgnoreCase(rows.getString(2)) || !matches(config, previous))
                             throw new IllegalArgumentException("迁入引擎不属于已保护的源元数据库，已阻止隔离启动");
-                        updates.add(Map.entry(rows.getLong(1), encode(rebind(config, next, tc), codec)));
+                        updates.add(Map.entry(rows.getLong(1), encode(versionMigration
+                                ? rebindEngine(config, next, tc) : rebind(config, next, tc), codec)));
                     }
                 }
                 if (updates.isEmpty()) throw new IllegalArgumentException("迁入环境缺少可验证的受管引擎");
@@ -191,6 +229,19 @@ final class SharedEngineConfiguration {
         result.put("dataBase", route.database());
         result.put("username", credentials.get("runtimeDbUser"));
         result.put("password", credentials.get("runtimeDbPassword"));
+        return result;
+    }
+
+    private static Map<String, Object> rebindEngine(Map<String, Object> original, DatabaseConnection route,
+            Map<String, String> credentials) {
+        // V2 serializes both configured fields and derived JDBC properties. Use V3's
+        // native MySQL connection shape and target JDBC options for the shared engine.
+        Map<String, Object> result = rebind(Map.of("type", "mysql"), route, credentials);
+        String url = credentials.get("runtimeDbUrl");
+        int separator = url.indexOf('?');
+        result.put("extraParams", separator < 0 ? "" : url.substring(separator + 1));
+        for (String key : List.of("initialPoolSize", "maxPoolSize", "minPoolSize", "queryTimeout"))
+            if (original.get(key) instanceof Number value) result.put(key, value);
         return result;
     }
 

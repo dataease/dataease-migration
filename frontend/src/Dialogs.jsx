@@ -11,9 +11,14 @@ import {
   DatabaseFields,
   Facts,
   CheckResults,
+  Elapsed,
+  SubmissionProgress,
+  taskInProgress,
 } from "./components";
-import { api, post, put, exportJson } from "./api";
+import { api, post, put, uploadFile } from "./api";
+import { useTaskSubmission } from "./useTaskSubmission";
 import { INSTANCE_ENVIRONMENTS } from "./instanceEnvironment";
+import TaskExecution from "./TaskExecution";
 
 export function Login({ session, onLogin }) {
   const [password, setPassword] = useState(""),
@@ -160,7 +165,8 @@ export function PasswordDialog({ onClose, onSaved }) {
     </Modal>
   );
 }
-export function ConnectDialog({ instance, onClose, onSaved }) {
+export function ConnectDialog({ instance, registerHost = false, onClose, onSaved }) {
+  const hostOnly = registerHost || instance?.status === "未安装";
   const [config, setConfig] = useState(
     instance
       ? { ...instance }
@@ -211,45 +217,46 @@ export function ConnectDialog({ instance, onClose, onSaved }) {
     setBusy(true);
     setError("");
     try {
+      const authentication = hostOnly ? credentials : {
+        ...credentials,
+        dbUser: config.dbUser || credentials.dbUser,
+        dbPassword: config.dbPassword || credentials.dbPassword,
+      };
       if (instance) {
         const updated = await put(`/instances/${instance.id}/connection`, {
-          credentials: {
-            ...credentials,
-            dbUser: config.dbUser || credentials.dbUser,
-            dbPassword: config.dbPassword || credentials.dbPassword,
-          },
+          credentials: authentication,
         });
         await onSaved(updated);
         return;
       }
       const result = await post("/instances/probe", {
+        mode: registerHost ? "host" : undefined,
         config: {
           ...config,
           host: config.connection === "local" ? "127.0.0.1" : config.host,
         },
-        credentials: {
-          ...credentials,
-          dbUser: config.dbUser || credentials.dbUser,
-          dbPassword: config.dbPassword || credentials.dbPassword,
-        },
+        credentials: authentication,
       });
-      if (requestEpoch === epoch.current) setProbe(result);
+      if (requestEpoch !== epoch.current) return;
+      if (registerHost) await register(result);
+      else setProbe(result);
     } catch (error) {
       if (requestEpoch === epoch.current) setError(error.message);
     } finally {
       setBusy(false);
     }
   };
+  const register = async (result) => {
+    await onSaved(await post("/instances", {
+      probeId: result.probeId,
+      name: config.name.trim(),
+      environment: config.environment,
+    }));
+  };
   const save = async () => {
     setBusy(true);
     try {
-      await onSaved(
-        await post("/instances", {
-          probeId: probe.probeId,
-          name: config.name.trim(),
-          environment: config.environment,
-        }),
-      );
+      await register(probe);
     } catch (error) {
       setError(error.message);
     } finally {
@@ -259,7 +266,7 @@ export function ConnectDialog({ instance, onClose, onSaved }) {
   const detected = probe?.instance;
   return (
     <Modal
-      title={instance ? `连接设置 · ${instance.name}` : "接入已有实例"}
+      title={instance ? `连接设置 · ${instance.name}` : registerHost ? "添加新实例" : "接入已有实例"}
       onClose={onClose}
       busy={busy}
       actions={
@@ -276,7 +283,9 @@ export function ConnectDialog({ instance, onClose, onSaved }) {
               ? "正在处理…"
               : instance
                 ? "验证并保存"
-                : probe
+                : registerHost
+                  ? "验证并添加"
+                  : probe
                   ? "确认接入"
                   : "测试并识别"}
           </Button>
@@ -318,13 +327,13 @@ export function ConnectDialog({ instance, onClose, onSaved }) {
             }
           >
             <option value="ssh">远程服务器 · SSH</option>
-            <option value="local">本机 · 本地目录</option>
+            <option value="local">运维中心所在服务器</option>
           </Select>
         </Field>
       )}
       {config.connection === "local" ? (
         <Notice>
-          本机指运维中心服务所在的服务器，由服务运行账户读取安装目录。
+          {hostOnly ? "通过运维中心服务运行账户验证本机连接。" : "本机指运维中心服务所在的服务器，由服务运行账户读取安装目录。"}
         </Notice>
       ) : (
         <Field
@@ -342,15 +351,15 @@ export function ConnectDialog({ instance, onClose, onSaved }) {
         local={config.connection === "local"}
         saved={!!instance}
       />
-      <Field
+      {!hostOnly && <Field
         label="已有安装目录"
         readOnly={!!instance}
         value={config.path}
         onChange={(event) =>
           change(setConfig, { ...config, path: event.target.value })
         }
-      />
-      {instance ? (
+      />}
+      {!hostOnly && (instance ? (
         <>
           <Field
             label="数据库用户名"
@@ -408,7 +417,7 @@ export function ConnectDialog({ instance, onClose, onSaved }) {
             />
           )}
         </>
-      )}
+      ))}
       {detected && (
         <section className="discovery-result">
           <strong>实例识别成功</strong>
@@ -433,26 +442,28 @@ export function ConnectDialog({ instance, onClose, onSaved }) {
 export function UploadDialog({ kind, onClose, onSaved }) {
   const [file, setFile] = useState(null),
     [password, setPassword] = useState(""),
-    [busy, setBusy] = useState(false),
+    [transfer, setTransfer] = useState(null),
     [error, setError] = useState("");
+  const busy = !!transfer;
   const submit = async () => {
     if (!file) return;
-    setBusy(true);
+    setTransfer({ phase: "uploading", percent: null, startedAt: new Date().toISOString() });
     setError("");
     try {
       const form = new FormData();
       form.append("file", file);
       form.append("kind", kind);
       if (kind === "backup") form.append("password", password);
-      const result = await post(
+      const result = await uploadFile(
         kind === "backup" ? "/backups/import" : "/packages",
         form,
+        (update) => setTransfer((current) => ({ ...current, ...update })),
       );
       await onSaved(result);
     } catch (error) {
       setError(error.message);
     } finally {
-      setBusy(false);
+      setTransfer(null);
     }
   };
   return (
@@ -466,6 +477,7 @@ export function UploadDialog({ kind, onClose, onSaved }) {
       }
       onClose={onClose}
       busy={busy}
+      busyLabel={null}
       wide={false}
       actions={
         <>
@@ -473,7 +485,7 @@ export function UploadDialog({ kind, onClose, onSaved }) {
             取消
           </Button>
           <Button primary disabled={!file || busy} onClick={submit}>
-            {busy ? "正在上传与校验…" : "上传并校验"}
+            {kind === "backup" ? "导入并校验" : "上传并校验"}
           </Button>
         </>
       }
@@ -514,6 +526,14 @@ export function UploadDialog({ kind, onClose, onSaved }) {
           ? "校验密码、备份清单和全部文件后入库。导入不会修改实例，也不会继承原来的演练或异机保护状态。"
           : "服务端计算 SHA-256、检查归档内容与能力清单；不从文件名推断兼容性。"}
       </Notice>
+      {transfer && <div className="wf-check-progress">
+        <strong role="status"><span className="task-spinner" aria-hidden="true" />
+          {transfer.phase === "uploading" ? "正在上传文件" : "上传完成，等待服务端校验"}
+        </strong>
+        <Elapsed since={transfer.startedAt} />
+        {transfer.phase === "uploading" && transfer.percent != null &&
+          <span aria-label="文件上传进度">{transfer.percent}%</span>}
+      </div>}
       {error && <Notice tone="red">{error}</Notice>}
     </Modal>
   );
@@ -552,6 +572,7 @@ export function ExportBackupDialog({ backup, onClose, onSaved }) {
       title="导出备份"
       wide={false}
       busy={busy}
+      busyLabel="正在校验并打包备份"
       onClose={onClose}
       actions={
         <>
@@ -563,7 +584,7 @@ export function ExportBackupDialog({ backup, onClose, onSaved }) {
             disabled={busy || !password || !confirmation}
             onClick={submit}
           >
-            {busy ? "正在校验与打包…" : "导出并下载"}
+            导出并下载
           </Button>
         </>
       }
@@ -602,12 +623,58 @@ export function ExportBackupDialog({ backup, onClose, onSaved }) {
   );
 }
 
-const manualItems = [
-  ["login", "登录与权限"],
-  ["dashboard", "代表性仪表板与大屏"],
-  ["connections", "数据源与写入目标"],
-  ["entry", "实际业务入口"],
-];
+export function InstanceAdminDialog({ instance, uninstall, onClose, onQueued }) {
+  const [password, setPassword] = useState("");
+  const [initialAdmin, setInitialAdmin] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const confirm = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const action = uninstall ? "uninstall" : "initial-admin";
+      const result = await post(`/instances/${instance.id}/${action}`, { password });
+      if (uninstall) onQueued(result);
+      else setInitialAdmin(result);
+    } catch (failure) {
+      setError(failure.message);
+    } finally {
+      setPassword("");
+      setBusy(false);
+    }
+  };
+  return (
+    <Modal title={uninstall ? "卸载 DataEase" : instance.hasMigratedInitialAdmin ? "查看迁入的初始密码" : "查看 DataEase 初始密码"} wide={false}
+      onClose={onClose} busy={busy} actions={
+        <>
+          <Button onClick={onClose} disabled={busy}>{initialAdmin ? "关闭" : "取消"}</Button>
+          {!initialAdmin && (
+            <Button primary disabled={busy || !password} onClick={confirm}>
+              {busy ? "正在确认…" : uninstall ? "确认卸载" : "验证并查看"}
+            </Button>
+          )}
+        </>
+      }>
+      <Facts rows={[["实例", instance.name], ["服务器", instance.host]]} />
+      {uninstall && (
+        <Notice tone="amber">移除该实例的容器、专用网络和闲置镜像，归档原数据。实例和连接设置会保留，状态变为「未安装」。Docker、Compose 和共享镜像会保留。</Notice>
+      )}
+      {initialAdmin ? (
+        <>
+          <Facts rows={[["用户名", initialAdmin.username]]} />
+          <Field label={instance.hasMigratedInitialAdmin ? "已验证的 V2 初始密码" : "安装时生成的初始密码"}
+            value={initialAdmin.password} readOnly autoComplete="off" />
+          <Notice>如果已在 DataEase 内修改密码，请使用修改后的密码。</Notice>
+        </>
+      ) : (
+        <Field label="运维中心 admin 密码" type="password" value={password}
+          autoComplete="current-password" onChange={(event) => setPassword(event.target.value)} />
+      )}
+      {error && <Notice tone="red">{error}</Notice>}
+    </Modal>
+  );
+}
+
 export function TaskDialog({
   task,
   state,
@@ -617,39 +684,26 @@ export function TaskDialog({
   onAbort,
   onReconcile,
   onAutomation,
+  onInitialAdmin,
 }) {
-  const [draft, setDraft] = useState(
-      task.acceptance || {
-        manual: {},
-        notes: "",
-        releaseMode: "isolated",
-        releaseConfirmed: false,
-        automation: { sync: false, reports: false, alerts: false },
-      },
-    ),
-    [error, setError] = useState(""),
-    [busy, setBusy] = useState(false),
-    [queryDialog, setQueryDialog] = useState(false),
-    [query, setQuery] = useState("");
-  const change = (key, value) =>
-    setDraft((old) => ({
-      ...old,
-      [key]: value,
-      ...(key !== "releaseConfirmed" ? { releaseConfirmed: false } : {}),
-    }));
+  const [releaseMode, setReleaseMode] = useState(task.acceptance?.releaseMode || "isolated");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const acceptance = task.acceptance || {};
+  const acceptanceReady = acceptance.automatedPassed === true;
+  const running = taskInProgress(task);
+  const uninstalling = state.tasks.some((item) => item.kind === "uninstall" && item.targetId === task.targetId
+    && ["queued", "running", "reconciliation_required", "reconciling"].includes(item.state));
+  const awaitingDecision = task.status === "待验收" && !uninstalling;
+  const registeredTarget = task.currentTarget === false ? null
+    : state.instances.find((item) => item.id === task.targetId);
+  const target = registeredTarget || task.targetInstanceSnapshot;
   const execute = async (action) => {
     setBusy(true);
     setError("");
     try {
-      if (action === "check") await post(`/tasks/${task.id}/acceptance/check`);
-      else {
-        await put(`/tasks/${task.id}/acceptance`, {
-          ...draft,
-          releaseConfirmed: false,
-        });
-        await put(`/tasks/${task.id}/acceptance`, draft);
-        await post(`/tasks/${task.id}/acceptance/complete`);
-      }
+      await post(`/tasks/${task.id}/acceptance/${action}`, action === "complete"
+        ? { releaseMode, confirmRelease: true } : {});
       await onRefresh();
     } catch (error) {
       setError(error.message);
@@ -657,56 +711,33 @@ export function TaskDialog({
       setBusy(false);
     }
   };
-  const acceptance = task.acceptance || {};
-  const acceptanceReady =
-    acceptance.automatedPassed === true &&
-    manualItems.every(([key]) => draft.manual?.[key]);
-  const target =
-    task.targetInstanceSnapshot ||
-    state.instances.find((item) => item.id === task.targetId);
   const protectionId = task.targetBackupId || task.protectionBackups?.targetId;
   const protection = state.backups.find((item) => item.id === protectionId);
-  const stages = Array.isArray(task.stages) ? task.stages : [];
-  const logs = Array.isArray(task.logs)
-    ? task.logs
-        .map((item) =>
-          typeof item === "string"
-            ? item
-            : item.message || JSON.stringify(item),
-        )
-        .join("\n")
-    : task.logs || "";
-  const editQuery = async () => {
-    setBusy(true);
-    setError("");
-    try {
-      await put(`/instances/${task.targetId}/environment`, {
-        environmentConfig: { acceptanceQuery: query },
-      });
-      setDraft((old) => ({ ...old, releaseConfirmed: false }));
-      await post(`/tasks/${task.id}/acceptance/check`);
-      await onRefresh();
-      setQueryDialog(false);
-    } catch (error) {
-      setError(error.message);
-    } finally {
-      setBusy(false);
-    }
-  };
+  const canRecover = registeredTarget?.recoveryRequired && task.status === "失败" && task.dataChanged
+    && protection && protection.restoreMode !== "manual"
+    && state.tasks.find((item) => item.targetId === task.targetId && item.currentTarget !== false && item.dataChanged)?.targetBackupId === protectionId;
+  const results = task.report?.checks ??
+    (task.liveChecks?.length ? task.liveChecks : running ? [] : acceptance.checks ?? []);
+  const timeLabel = task.startedAt ? "开始时间" : "提交时间";
+  const taskTime = task.startedAt || task.createdAt
+    ? new Date(task.startedAt || task.createdAt).toLocaleString("zh-CN", { hour12: false })
+    : task.date || "—";
   return (
     <>
       <Modal
         title={task.title || task.name || task.kind}
         onClose={onClose}
         busy={busy}
+        busyLabel="正在提交验收"
+        className="task-dialog"
         actions={
           <>
             <Button disabled={busy} onClick={onClose}>
               关闭
             </Button>
-            {task.status === "失败" && task.dataChanged && protection && (
+            {canRecover && (
               <Button
-                onClick={() => onRestore(protection, task.targetId, task.id)}
+                onClick={() => onRestore(protection, task.targetId, task.id, task.rollbackPackageId)}
               >
                 还原目标保护备份
               </Button>
@@ -714,257 +745,136 @@ export function TaskDialog({
             {task.state === "reconciliation_required" && (
               <Button onClick={() => onReconcile(task)}>核查执行状态</Button>
             )}
-            {task.status === "待验收" && (
+            {awaitingDecision && (
               <Button disabled={busy} onClick={() => onAbort(task)}>
                 停止并结束验收
               </Button>
             )}
-            {task.status === "待验收" && (
-              <Button
-                primary
-                disabled={busy || !acceptanceReady || !draft.releaseConfirmed}
-                onClick={() => execute("complete")}
-              >
-                {draft.releaseMode === "open"
-                  ? "完成验收并开放访问"
-                  : "完成验收，保持隔离"}
+            {["install", "migrate"].includes(task.kind)
+                && (registeredTarget?.hasInitialAdmin || registeredTarget?.hasMigratedInitialAdmin) && (
+              <Button onClick={() => onInitialAdmin(registeredTarget)}>
+                {registeredTarget.hasMigratedInitialAdmin ? "查看迁入的初始密码" : "查看初始密码"}
+              </Button>
+            )}
+            {awaitingDecision && (
+              <Button primary disabled={busy || !acceptanceReady} onClick={() => execute("complete")}>
+                {releaseMode === "open" ? "完成验收并开放访问" : "完成验收，保持隔离"}
               </Button>
             )}
           </>
         }
       >
-        <Facts
-          rows={[
-            ["任务编号", task.id],
-            ["状态", task.status],
-            ...(task.kind === "migrate"
-              ? [
-                  ["源实例", task.instanceName || task.instanceSnapshot?.name],
-                  ["目标实例", target?.name || task.targetName],
-                ]
-              : [
-                  [
-                    "操作实例",
-                    target?.name || task.targetName || task.instanceName,
-                  ],
-                ]),
-            [
-              "开始时间",
-              task.createdAt
-                ? new Date(task.createdAt).toLocaleString("zh-CN", {
-                    hour12: false,
-                  })
-                : task.date,
-            ],
-            ...(task.failureStage ? [["失败阶段", task.failureStage]] : []),
-          ]}
-        />
-        {task.error && <Notice tone="red">{task.error}</Notice>}
-        {(task.status === "失败" ||
-          task.state === "reconciliation_required") && (
-          <Notice tone="amber">
-            {task.state === "reconciliation_required"
-              ? "执行是否结束尚未确认，请先核查现场状态，暂不重试或恢复。"
-              : task.kind === "automation"
-                ? "自动任务变更未完成。请刷新实时清单核对调度状态，已经开始的任务可能继续执行。"
-              : task.dataChanged
-                ? protection
-                  ? "目标已发生变更，未自动回滚。可使用本任务保留的目标保护备份恢复变更前状态。"
-                  : "目标可能已发生变更，未自动回滚。请先核对目标状态与可用恢复点。"
-                : "任务尚未进入数据覆盖阶段，应用仍可能已停止。请先核对失败原因和实例状态，再重新发起操作。"}
-          </Notice>
-        )}
-        {task.state === "succeeded" &&
-          ["migrate", "restore", "install", "upgrade", "plugin"].includes(
-            task.kind,
-          ) && (
-            <Notice>
-              {task.acceptance?.releaseMode === "open"
-                ? "本次验收选择开放业务访问。"
-                : "本次验收选择保持环境隔离。"}
-              自动任务需要在开放验收后单独选择恢复，实际状态请从自动任务清单核对。
-              {task.acceptance?.releaseMode === "open" && onAutomation && (
-                <Button small onClick={() => onAutomation(task.targetId)}>
-                  管理自动任务
-                </Button>
-              )}
-            </Notice>
-          )}
-        {task.automationResult && (
-          <>
-            <Notice>
-              已回读实际调度状态。仅所选任务获准运行，未选择和未知任务继续拦截；应用重启后授权失效，需要重新核验。
-            </Notice>
-            <CheckResults checks={task.automationResult.jobs
-              .filter((job) => job.category !== "unsupported")
-              .map((job) => ({ title: job.name, status: "passed", detail: job.enabled ? "已恢复调度" : "保持暂停" }))} />
-          </>
-        )}
-        {task.status === "执行中" && (
-          <div className="live-progress">
-            <div
-              style={{ width: `${Math.min(100, Number(task.progress) || 0)}%` }}
-            />
+        <div className="task-dialog-content">
+          <div className="task-summary">
+            <Badge tone={running ? "blue" : task.status === "失败" ? "red" : task.status === "成功" ? "green" : "amber"}>
+              {task.status || "未知"}
+            </Badge>
+            <dl>
+              {(task.kind === "migrate" ? [
+                ["源实例", task.instanceName || task.instanceSnapshot?.name],
+                ["目标实例", target?.name || task.targetName],
+              ] : [["操作实例", target?.name || task.targetName || task.instanceName]]).map(([label, value]) => (
+                <div className="task-summary-instance" key={label}>
+                  <dt>{label}</dt><dd title={value}>{value || "—"}</dd>
+                </div>
+              ))}
+              <div className="task-summary-time"><dt>{timeLabel}</dt><dd>{taskTime}</dd></div>
+              <div className="task-summary-id"><dt>任务编号</dt><dd>{task.id}</dd></div>
+            </dl>
           </div>
-        )}
-        {stages.length > 0 && (
-          <details open={task.status !== "待验收"}>
-            <summary>执行阶段与处理记录</summary>
-            <CheckResults
-              checks={stages.map((stage) => ({
-                ...stage,
-                title: stage.title || stage.name,
-                detail: stage.detail || stage.message,
-                status: stage.status === "completed" ? "passed" : stage.status,
-              }))}
-            />
-          </details>
-        )}
-        {task.status === "待验收" && (
-          <section className="lc-acceptance">
-            <h3>业务验收与访问控制</h3>
-            <Notice>
-              目标隔离运行，业务访问未开放。请完成自动检查及业务核对，再选择访问策略。自动任务继续暂停，开放验收后可单独选择恢复。
-            </Notice>
-            <div className="button-row">
-              <Button disabled={busy} onClick={() => execute("check")}>
-                {busy ? "正在处理…" : "运行验收检查"}
-              </Button>
-              <Button
-                disabled={busy}
-                onClick={() => {
-                  setQuery(
-                    state.instances.find((item) => item.id === task.targetId)
-                      ?.environmentConfig?.acceptanceQuery || "",
-                  );
-                  setError("");
-                  setQueryDialog(true);
-                }}
-              >
-                维护验收查询
-              </Button>
-            </div>
-            <CheckResults
-              prioritize
-              actionTypes={["query"]}
-              checks={acceptance.checks || acceptance.automatedChecks || []}
-              onAction={(action) => {
-                if (action.type === "query") {
-                  setQuery(
-                    state.instances.find((item) => item.id === task.targetId)
-                      ?.environmentConfig?.acceptanceQuery || "",
-                  );
-                  setError("");
-                  setQueryDialog(true);
-                }
-              }}
-            />
-            {manualItems.map(([key, label]) => (
-              <Check
-                key={key}
-                checked={draft.manual?.[key]}
-                onChange={(value) =>
-                  change("manual", { ...draft.manual, [key]: value })
-                }
-              >
-                {label}
-              </Check>
-            ))}
-            <Field label="验收说明 / 不适用项">
-              <textarea
-                rows="3"
-                maxLength={4000}
-                value={draft.notes || ""}
-                onChange={(event) => change("notes", event.target.value)}
-              />
-            </Field>
-            <Field label="验收后的访问策略">
-              <Select
-                aria-label="验收后的访问策略"
-                value={draft.releaseMode || "isolated"}
-                onChange={(event) => change("releaseMode", event.target.value)}
-              >
-                <option value="isolated">通过后保持隔离</option>
-                <option
-                  value="open"
-                  disabled={task.restorePurpose === "rehearsal"}
-                >
-                  通过后开放业务访问
-                </option>
-              </Select>
-            </Field>
-            {!acceptanceReady && (
-              <Notice>
-                请先通过自动检查，并完成全部业务核对，再确认验收结果。
+          <TaskExecution task={task} active={running} />
+          <div className="task-context" tabIndex={0} role="region" aria-label="补充任务信息">
+            {task.error && <Notice tone="red">{task.error}</Notice>}
+            {((task.status === "失败" && !["release", "backup", "check", "service", "uninstall"].includes(task.kind)) ||
+              task.state === "reconciliation_required") && (
+              <Notice tone="amber">
+                {task.state === "reconciliation_required"
+                  ? "执行是否结束尚未确认，请先核查现场状态，暂不重试或恢复。"
+                  : task.kind === "automation"
+                    ? "自动任务变更未完成。请刷新实时清单核对调度状态，已经开始的任务可能继续执行。"
+                  : task.sameHostMigration
+                    ? "源 V2 数据保留。请在实例管理核对源应用状态，必要时启动原 V2。若已创建独立 V3，可检查失败日志后卸载该 V3 再重试。"
+                  : task.dataChanged
+                    ? canRecover
+                      ? "目标已发生变更，未自动回滚。可使用本任务保留的目标保护备份恢复变更前状态。"
+                      : registeredTarget && !registeredTarget.recoveryRequired
+                        ? "目标已完成后续处理。当前状态见实例管理。"
+                        : "请核对目标状态与可用恢复点。"
+                    : "请核对失败原因和实例状态，再重新发起操作。"}
               </Notice>
             )}
-            <Check
-              checked={draft.releaseConfirmed}
-              disabled={!acceptanceReady}
-              onChange={(value) => change("releaseConfirmed", value)}
-            >
-              已核对目标与验收结果，确认
-              {draft.releaseMode === "open"
-                ? "开放本环境业务访问"
-                : "保持本环境隔离"}
-            </Check>
-          </section>
-        )}
-        {task.kind === "check" && task.report?.checks && (
-          <>
-            <h3>检查结果</h3>
-            <CheckResults checks={task.report.checks} />
-          </>
-        )}
-        {error && <Notice tone="red">{error}</Notice>}
-        <div className="live-log-head">
-          <h3>执行日志</h3>
-          <Button
-            small
-            icon="download"
-            onClick={() => exportJson(`task-${task.id}.json`, task)}
-          >
-            导出任务记录
-          </Button>
+            {task.kind === "release" && task.state === "succeeded" && (
+              <Notice>业务入口已开放并通过核验，自动任务保持暂停。</Notice>
+            )}
+            {task.state === "succeeded" &&
+              ["migrate", "restore", "install", "upgrade", "plugin"].includes(
+                task.kind,
+              ) && (
+                <Notice>
+                  {task.restorePurpose === "rehearsal" ? "演练已通过，业务入口关闭，自动任务继续暂停。"
+                    : task.acceptance?.releaseMode === "open"
+                      ? "业务入口已开放，可按需恢复自动任务。"
+                      : "已保持隔离运行，业务入口关闭，自动任务继续暂停。"}
+                  {task.acceptance?.releaseMode === "open" && onAutomation && (
+                    <Button small onClick={() => onAutomation(task.targetId)}>
+                      管理自动任务
+                    </Button>
+                  )}
+                </Notice>
+              )}
+            {task.automationResult && (
+              <>
+                <Notice>
+                  {task.automationResult.schedulingSuspended
+                    ? task.automationResult.runningJobs > 0
+                      ? `后续自动调度已暂停，核验时仍有 ${task.automationResult.runningJobs} 个已开始的任务在执行。`
+                      : "自动调度已暂停。"
+                    : "仅所选任务获准运行，应用重启后需要重新授权。"}
+                </Notice>
+                <CheckResults checks={task.automationResult.jobs
+                  .filter((job) => job.category !== "unsupported")
+                  .map((job) => ({ title: job.name, status: "passed", detail: job.enabled ? "已恢复调度" : "后续调度已暂停" }))} />
+              </>
+            )}
+            {results.length > 0 && (
+              <details>
+                <summary>{task.kind === "check" ? "检查结果" : "运行核验结果"}</summary>
+                <CheckResults checks={results} />
+              </details>
+            )}
+            {task.status === "待验收" && uninstalling && <Notice>该实例正在处理卸载，请在任务中心查看卸载任务。</Notice>}
+            {awaitingDecision && (
+              <section className="lc-acceptance">
+                <h3>{task.restorePurpose === "rehearsal" ? "演练验收" : "验收后的访问策略"}</h3>
+                {!acceptanceReady && (
+                  <div className="button-row">
+                    <Button disabled={busy} onClick={() => execute("check")}>重新核验</Button>
+                  </div>
+                )}
+                {task.restorePurpose !== "rehearsal" && <Field label="访问策略">
+                  <Select aria-label="验收后的访问策略" value={releaseMode}
+                    onChange={(event) => setReleaseMode(event.target.value)}>
+                    <option value="isolated">保持隔离</option>
+                    <option value="open">开放业务访问</option>
+                  </Select>
+                </Field>}
+                <Notice>
+                  {task.restorePurpose === "rehearsal" ? "验收后继续隔离运行，业务入口关闭。" : releaseMode === "open"
+                    ? "复核运行条件后切换至正式网络，按部署配置发布业务入口。切换会重建应用及相关容器，并等待入口核验通过。"
+                    : "保留当前隔离网络和端口限制，应用继续运行，业务入口保持关闭。"}
+                  自动任务继续暂停。
+                </Notice>
+              </section>
+            )}
+            {error && <Notice tone="red">{error}</Notice>}
+            <details className="task-compact-meta">
+              <summary>任务信息</summary>
+              <Facts rows={[[timeLabel, taskTime], ["任务编号", task.id]]} />
+            </details>
+          </div>
         </div>
-        <pre className="live-logs">{logs || "尚无执行日志"}</pre>
       </Modal>
-      {queryDialog && (
-        <Modal
-          title="业务验收查询"
-          wide={false}
-          busy={busy}
-          onClose={() => setQueryDialog(false)}
-          actions={
-            <>
-              <Button disabled={busy} onClick={() => setQueryDialog(false)}>
-                取消
-              </Button>
-              <Button
-                primary
-                disabled={busy || !query.trim()}
-                onClick={editQuery}
-              >
-                {busy ? "正在检查…" : "保存并重新检查"}
-              </Button>
-            </>
-          }
-        >
-          <Notice>
-            填写能够返回业务样例的只读
-            SELECT。保存后重新检查，原验收确认失效；不代替仪表板和权限的人工核对。
-          </Notice>
-          <Field label="业务验收查询（只读 SQL）">
-            <textarea
-              rows="6"
-              maxLength={16000}
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-            />
-          </Field>
-          {error && <Notice tone="red">{error}</Notice>}
-        </Modal>
-      )}
+
     </>
   );
 }
@@ -974,14 +884,13 @@ export function AutomationDialog({ instance, onClose, onQueued }) {
   const loadGeneration = useRef(0);
   const [catalog, setCatalog] = useState(null),
     [selected, setSelected] = useState([]),
-    [check, setCheck] = useState(null),
     [confirmName, setConfirmName] = useState(""),
-    [confirmed, setConfirmed] = useState(false),
     [busy, setBusy] = useState(false),
     [error, setError] = useState("");
+  const { progress, submit, reset } = useTaskSubmission();
   const load = async () => {
     const generation = ++loadGeneration.current;
-    setBusy(true); setError(""); setCatalog(null); setSelected([]); setCheck(null); setConfirmed(false); setConfirmName("");
+    setBusy(true); setError(""); setCatalog(null); setSelected([]); setConfirmName(""); reset();
     try {
       const actual = await api(`/instances/${instance.id}/automation`);
       if (generation !== loadGeneration.current) return;
@@ -993,52 +902,47 @@ export function AutomationDialog({ instance, onClose, onQueued }) {
     finally { if (generation === loadGeneration.current) setBusy(false); }
   };
   useEffect(() => { load(); return () => { loadGeneration.current++; }; }, [instance.id]);
-  const command = { kind: "automation", sourceId: instance.id, automationSnapshot: catalog?.snapshot, selectedJobs: selected };
-  const inspect = async () => {
-    setBusy(true); setError(""); setConfirmed(false); setConfirmName("");
-    try { setCheck(await post("/prechecks", command)); }
-    catch (failure) { setError(failure.message); }
-    finally { setBusy(false); }
+  const updateSelection = (selection) => {
+    setSelected(selection);
+    reset();
   };
-  const submit = async () => {
+  const confirm = async () => {
     setBusy(true); setError("");
     try {
-      const task = await post("/tasks", { ...command, precheckId: check.id, confirmTargetName: confirmName });
-      await onQueued(task);
-    } catch (failure) { setError(failure.message); setCheck(null); }
+      const result = await submit({
+        kind: "automation", sourceId: instance.id, automationSnapshot: catalog.snapshot,
+        selectedJobs: selected, confirmTargetName: confirmName,
+      });
+      if (result?.task) onQueued(result.task);
+    } catch (failure) { setError(failure.message); }
     finally { setBusy(false); }
   };
   return (
-    <Modal title="管理自动任务" busy={busy} onClose={onClose} actions={<>
+    <Modal title="管理自动任务" busy={busy} busyLabel={progress ? null : "读取实际调度状态"} onClose={onClose} actions={<>
       <Button disabled={busy} onClick={onClose}>取消</Button>
-      {check ? <>
-        <Button disabled={busy} onClick={() => { setCheck(null); setConfirmed(false); }}>返回选择</Button>
-        <Button primary disabled={busy || !check.passed || !confirmed || confirmName !== instance.name} onClick={submit}>
-          {busy ? "提交中…" : selected.length ? "确认恢复所选任务" : "确认全部暂停"}
-        </Button>
-      </> : <>
-        <Button disabled={busy} onClick={load}>刷新实际状态</Button>
-        <Button primary disabled={busy || !catalog} onClick={inspect}>{busy ? "检查中…" : "检查并确认"}</Button>
-      </>}
+      <Button disabled={busy} onClick={load}>刷新实际状态</Button>
+      <Button primary disabled={busy || !catalog || confirmName !== instance.name} onClick={confirm}>
+        {selected.length ? "确认恢复所选任务" : "确认全部暂停"}
+      </Button>
     </>}>
       <Facts rows={[["操作实例", instance.name], ["环境", instance.environment || instance.tag || "—"], ["服务器", instance.host || "—"]]} />
       {error && <Notice tone="red">{error}</Notice>}
-      {busy && !catalog && <Notice>正在读取实际调度状态…</Notice>}
-      {!check && catalog && <>
+      {catalog && <>
         <Notice>
           仅恢复已在 DataEase 启用且已注册的计划任务。取消选择会暂停后续调度，不会取消已经开始的任务。
           恢复时跳过积压时点；同步将写入目标数据源，报告与告警可能向原接收人发送消息。
         </Notice>
         <div className="automation-selection-heading">
           <strong>已选择 {selected.length} 项</strong>
-          <Button small onClick={() => setSelected([])}>全部保持暂停</Button>
+          <Button small disabled={!selected.length} onClick={() => updateSelection([])}>全部保持暂停</Button>
         </div>
         {Object.entries(automationLabels).filter(([category]) => category !== "unsupported").map(([category, label]) => {
           const jobs = catalog.jobs.filter((job) => job.category === category);
           return <section className="automation-category" key={category}>
             <h3 className="section-title">{label} <span className="muted">{jobs.length} 项</span></h3>
             {jobs.length ? jobs.map((job) => <div className="automation-job" key={job.id}>
-              <Check checked={selected.includes(job.id)} disabled={!job.available} onChange={() => setSelected((old) => old.includes(job.id) ? old.filter((id) => id !== job.id) : [...old, job.id])}>
+              <Check checked={selected.includes(job.id)} disabled={!job.available}
+                onChange={(checked) => updateSelection(checked ? [...selected, job.id] : selected.filter((id) => id !== job.id))}>
                 {job.name}
               </Check>
               <Badge tone={job.enabled ? "green" : "gray"}>{job.enabled ? "已恢复调度" : "保持暂停"}</Badge>
@@ -1050,15 +954,10 @@ export function AutomationDialog({ instance, onClose, onQueued }) {
           <p className="muted">另有 {catalog.jobs.filter((job) => job.category === "unsupported").length} 项系统或暂不支持的计划，继续保持暂停。</p>
         )}
         <Notice>应用重启后恢复授权失效，所有自动任务重新暂停；刷新本页可核对实际状态。停用、过期或缺少有效企业授权的任务，请先在 DataEase 处理。</Notice>
+        <Field label={`输入“${instance.name}”确认目标`} value={confirmName}
+          onChange={(event) => setConfirmName(event.target.value)} autoComplete="off" />
       </>}
-      {check && <>
-        <CheckResults checks={check.checks || []} prioritize />
-        <h3 className="section-title">{selected.length ? `本次将恢复 ${selected.length} 项任务` : "本次将暂停全部后续调度"}</h3>
-        {selected.length ? catalog.jobs.filter((job) => selected.includes(job.id)).map((job) => <p key={job.id}>{automationLabels[job.category]} · {job.name}</p>) : <Notice>全部任务保持暂停，已开始的任务不会被强行取消。</Notice>}
-        {selected.length > 0 && <Notice tone="amber">未选择的任务继续暂停。恢复后可能写入业务数据或发送消息，请核对目标与原有任务配置。</Notice>}
-        <Field label="确认实例名称" value={confirmName} onChange={(event) => setConfirmName(event.target.value)} placeholder={instance.name} autoComplete="off" />
-        <Check checked={confirmed} onChange={() => setConfirmed(!confirmed)}>{selected.length ? "已核对任务的数据目标、接收人和执行计划，确认本次调度范围。" : "确认暂停全部后续调度，已经开始的任务可能继续执行。"}</Check>
-      </>}
+      {progress && <SubmissionProgress progress={progress} />}
     </Modal>
   );
 }

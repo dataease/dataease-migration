@@ -13,9 +13,10 @@ final class AutomationManager {
     private final HostCommands host;
     private final ComposeManager compose;
     private final ObjectMapper json;
+    private final DatabaseArchive database;
 
-    AutomationManager(HostCommands host, ComposeManager compose, ObjectMapper json) {
-        this.host = host; this.compose = compose; this.json = json;
+    AutomationManager(HostCommands host, ComposeManager compose, ObjectMapper json, DatabaseArchive database) {
+        this.host = host; this.compose = compose; this.json = json; this.database = database;
     }
 
     Map<String, Object> inventory(Map<String, Object> instance, Map<String, String> credentials) throws Exception {
@@ -44,7 +45,8 @@ final class AutomationManager {
             }
             Set<String> actual = new HashSet<>();
             for (var row : jobs(verified)) if (Boolean.TRUE.equals(row.get("enabled"))) actual.add(String.valueOf(row.get("id")));
-            if (!actual.equals(new HashSet<>(selected)) || !Objects.equals(result.get("epoch"), verified.get("epoch"))
+            if (!actual.equals(new HashSet<>(selected)) || selected.isEmpty() && !schedulingSuspended(verified)
+                    || !Objects.equals(result.get("epoch"), verified.get("epoch"))
                     || !Objects.equals(before.get("businessSnapshot"), decorated.get("businessSnapshot"))) {
                 // Revoke every grant if the independent runtime read-back disagrees.
                 revoke(channel);
@@ -58,10 +60,14 @@ final class AutomationManager {
         try {
             read(channel.control(json.writeValueAsString(Map.of("revoke", true, "selected", List.of()))));
             var actual = read(channel.request(ApplicationIsolationGuard.ENDPOINT, "", null, null));
-            if (!Boolean.TRUE.equals(actual.get("schedulersPaused"))) throw new IllegalStateException();
+            if (!schedulingSuspended(actual)) throw new IllegalStateException();
         } catch (Exception unavailable) {
             throw new java.net.SocketException("撤销后的实际调度暂停状态未确认，请先现场核查");
         }
+    }
+
+    private boolean schedulingSuspended(Map<String, Object> result) {
+        return Boolean.TRUE.equals(result.getOrDefault("schedulingSuspended", result.get("schedulersPaused")));
     }
 
     private Map<String, Object> read(ContainerApplicationHttp.Response response) throws Exception {
@@ -82,7 +88,7 @@ final class AutomationManager {
             Map<String, String> credentials) throws Exception {
         List<String> signatures = new ArrayList<>();
         String runtimeSnapshot = String.valueOf(result.get("snapshot"));
-        try (Connection connection = DatabaseArchive.connect(instance, credentials)) {
+        try (Connection connection = database.connect(instance, credentials)) {
             for (var row : jobs(result)) {
                 String group = String.valueOf(row.get("group")), category = String.valueOf(row.get("category"));
                 String query = switch (category) {
@@ -129,7 +135,11 @@ final class AutomationManager {
                         if (table.equals("core_datasource_task")) definition.put("datasource", hash(definition(connection,
                                 "SELECT id,name,type,configuration FROM core_datasource WHERE id=?", group)));
                         signatures.add(hash(List.of(row.get("id"), definition)));
-                        if (!enabled) { row.put("available", false); row.put("reason", "业务任务已停用，请先在DataEase启用并刷新"); }
+                        if (!enabled) {
+                            row.put("available", false);
+                            row.put("enabled", false);
+                            row.put("reason", "业务任务已停用，请先在DataEase启用并刷新");
+                        }
                     } catch (SQLException unsupported) {
                         row.put("available", false); row.put("reason", "业务任务配置无法完整核验，请先在DataEase处理");
                         signatures.add(hash(List.of(row.get("id"), "unavailable")));
@@ -160,7 +170,8 @@ final class AutomationManager {
                     for (int n = 1; n <= columns.getColumnCount(); n++) {
                         String key = columns.getColumnLabel(n).toLowerCase(Locale.ROOT);
                         if (Set.of("last_exec_time", "last_exec_status", "last_execute_status", "trigger_last_time", "trigger_next_time",
-                                "increment_value", "qrtz_instance", "update_time", "status_time").contains(key)) continue;
+                                "increment_value", "qrtz_instance", "update_time", "status_time",
+                                "current_instance_id", "running_instance_id", "execution_token").contains(key)) continue;
                         // Only state flags are read as plain values, and none leave this method's caller.
                         if (Set.of("status", "_status", "task_status", "enable", "deleted").contains(key)) {
                             fields.put(key, Objects.toString(rs.getString(n), "")); continue;

@@ -110,6 +110,56 @@ public final class OperationsStore {
         }
     }
 
+    public synchronized void saveInstanceAndTask(Map<String, Object> instance, Map<String, Object> task) {
+        saveInstancesAndTask(List.of(instance), task);
+    }
+
+    public synchronized void saveInstancesAndTask(List<Map<String, Object>> instances, Map<String, Object> task) {
+        try {
+            database.setAutoCommit(false);
+            try {
+                for (var instance : instances) put("instances", String.valueOf(instance.get("id")), instance);
+                put("tasks", String.valueOf(task.get("id")), task);
+                database.commit();
+            } catch (SQLException | RuntimeException failure) {
+                database.rollback();
+                throw failure;
+            } finally {
+                database.setAutoCommit(true);
+            }
+        } catch (SQLException failure) {
+            throw new IllegalStateException("Cannot persist instances and task", failure);
+        }
+    }
+
+    public synchronized void finishUninstall(Map<String, Object> instance, Map<String, Object> task,
+            Map<String, Object> pendingInstall) {
+        String id = String.valueOf(instance.get("id"));
+        try {
+            database.setAutoCommit(false);
+            try {
+                for (String collection : List.of("plans", "healthPlans"))
+                    for (var plan : list(collection))
+                        if (id.equals(plan.get("instanceId"))) {
+                            plan.put("enabled", false);
+                            put(collection, String.valueOf(plan.get("id")), plan);
+                        }
+                put("tasks", String.valueOf(task.get("id")), task);
+                if (pendingInstall != null)
+                    put("tasks", String.valueOf(pendingInstall.get("id")), pendingInstall);
+                put("instances", id, instance);
+                database.commit();
+            } catch (SQLException | RuntimeException failure) {
+                database.rollback();
+                throw failure;
+            } finally {
+                database.setAutoCommit(true);
+            }
+        } catch (SQLException failure) {
+            throw new IllegalStateException("Cannot persist uninstallation result", failure);
+        }
+    }
+
     @PreDestroy
     public synchronized void close() {
         try {

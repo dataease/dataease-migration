@@ -9,13 +9,17 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.stereotype.Service;
 
 import java.io.*;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.security.MessageDigest;
 import java.time.Instant;
 import java.util.*;
 
 /** A reusable library of uploaded bytes and explicitly verified compatibility manifests. */
 @Service
 public final class MediaService {
+    private static final String FILE_STATE = "packageFileState";
     private static final long MAX_UPLOAD = 20L * 1024 * 1024 * 1024;
     private static final int MAX_MANIFEST = 1024 * 1024;
     private static final String UUID_PATTERN =
@@ -55,6 +59,7 @@ public final class MediaService {
         if (reservedId != null && Files.exists(directory)) ArchiveSupport.deleteTree(directory);
         OperationsFiles.createPrivateDirectory(directory);
         try {
+            MessageDigest checksum = MessageDigest.getInstance("SHA-256");
             try (InputStream input = source;
                     OutputStream output =
                             Files.newOutputStream(file, StandardOpenOption.CREATE_NEW)) {
@@ -66,6 +71,7 @@ public final class MediaService {
                     size += count;
                     if (size > MAX_UPLOAD) throw bad("上传介质超过 20GB 上限");
                     output.write(buffer, 0, count);
+                    checksum.update(buffer, 0, count);
                 }
                 if (size == 0) throw bad("上传文件为空");
             }
@@ -76,7 +82,7 @@ public final class MediaService {
             record.put("artifactPath", file.toString());
             record.put("sizeBytes", Files.size(file));
             record.put("size", size(Files.size(file)));
-            String digest = ArchiveSupport.sha256(file);
+            String digest = HexFormat.of().formatHex(checksum.digest());
             if (expectedSha256 != null && !expectedSha256.equals(digest))
                 throw bad("下载介质摘要在入库前发生变化");
             record.put("sha256", digest);
@@ -84,7 +90,7 @@ public final class MediaService {
             record.put("status", "待校验");
             // BackupService decrypts and validates the actual backup manifest; upload metadata
             // never supplies one.
-            return kind.equals("backup") ? record : verify(record);
+            return kind.equals("backup") ? record : inspect(record, file, digest);
         } catch (Exception exception) {
             ArchiveSupport.deleteTree(directory);
             throw exception;
@@ -93,9 +99,125 @@ public final class MediaService {
 
     public synchronized Map<String, Object> verify(Map<String, Object> record) throws Exception {
         Path file = getPath(record);
+        String before = record.containsKey(FILE_STATE) ? packageFileState(file) : null;
         String digest = ArchiveSupport.sha256(file);
         if (!(record.get("sha256") instanceof String expected) || !digest.equals(expected))
             throw bad("介质 SHA-256 与入库记录不一致，已阻止使用");
+        Map<String, Object> verified = inspect(record, file, digest);
+        if ("package".equals(record.get("kind")) && "已校验".equals(record.get("status"))
+                && record.get("files") instanceof Map<?, ?> files
+                && !files.isEmpty() && !files.equals(verified.get("files")))
+            throw bad("解包文件与原校验清单不一致，请移除后重新上传离线包。");
+        if (before != null) {
+            if (!before.equals(verified.get(FILE_STATE)))
+                throw bad("介质在校验期间发生变化，请核对后重新校验。");
+            for (String key : List.of("contentRoot", "manifestSource", "adapter", "version", "arch",
+                    "edition", "minimumUpgradeSource")) {
+                if (!Objects.equals(record.get(key), verified.get(key)))
+                    throw bad("介质身份与入库记录不一致，请重新上传离线包。");
+            }
+            if (!"builtin".equals(record.get("manifestSource"))
+                    && !Objects.equals(record.get("manifest"), verified.get("manifest")))
+                throw bad("介质清单与入库记录不一致，请重新上传离线包。");
+        }
+        return verified;
+    }
+
+    private Map<String, Object> inspect(Map<String, Object> record, Path file, String digest) throws Exception {
+        Map<String, Object> result = inspectContents(record, file, digest);
+        if ("package".equals(result.get("kind")) && "已校验".equals(result.get("status")))
+            result.put(FILE_STATE, packageFileState(file));
+        return result;
+    }
+
+    public boolean needsPackageVerification(Map<String, Object> record) {
+        return "package".equals(record.get("kind")) && "已校验".equals(record.get("status"))
+                && !record.containsKey(FILE_STATE);
+    }
+
+    public Map<String, Object> declareUpgradeCompatibility(Map<String, Object> record, Object requested) throws Exception {
+        var result = new LinkedHashMap<>(verifiedPackage(record));
+        if (!DataEaseOfflinePackage.ADAPTER.equals(result.get("adapter")))
+            throw bad("此介质需要由提供方通过完整执行清单声明升级兼容性。");
+        String minimum = version(requested);
+        String target = version(result.get("version"));
+        if (!minimum.substring(0, 3).equals(target.substring(0, 3)))
+            throw bad("最低可升级来源版本须与离线包主版本相同。");
+        if (compareVersions(minimum, target) >= 0)
+            throw bad("最低可升级来源版本须低于离线包版本。");
+        result.put("minimumUpgradeSource", minimum);
+        result.put("purposes", List.of("install", "upgrade", "restore"));
+        result.put("upgradeCompatibility", Map.of("sha256", result.get("sha256"), "minimumUpgradeSource", minimum));
+        if (result.get("manifest") instanceof Map<?, ?> existing) {
+            var manifest = new LinkedHashMap<String, Object>();
+            existing.forEach((key, value) -> manifest.put(String.valueOf(key), value));
+            manifest.put("minimumUpgradeSource", minimum);
+            manifest.put("purposes", result.get("purposes"));
+            result.put("manifest", manifest);
+        }
+        result.put("revision", record.get("revision") instanceof Number revision ? revision.longValue() + 1 : 1L);
+        return packageDisplay(result);
+    }
+
+    private static int compareVersions(String first, String second) {
+        String[] a = first.substring(1).split("\\.");
+        String[] b = second.substring(1).split("\\.");
+        for (int i = 0; i < 3; i++) {
+            int comparison = Integer.compare(Integer.parseInt(a[i]), Integer.parseInt(b[i]));
+            if (comparison != 0) return comparison;
+        }
+        return 0;
+    }
+
+    /** Execution consumes the sealed upload metadata; it never scans image or archive bytes. */
+    public Map<String, Object> verifiedPackage(Map<String, Object> record) throws Exception {
+        if (!"package".equals(record.get("kind")) || !"已校验".equals(record.get("status")))
+            throw bad(text(record.getOrDefault("validationMessage", "离线包尚未通过校验。")));
+        if (needsPackageVerification(record))
+            throw bad("该离线包需要在软件包库完成一次校验后才能使用。");
+        checkPackageFileState(record, getPath(record));
+        return packageDisplay(record);
+    }
+
+    private void checkPackageFileState(Map<String, Object> record, Path artifact) throws Exception {
+        if (!Objects.equals(record.get(FILE_STATE), packageFileState(artifact)))
+            throw bad("离线包或解包文件的状态已变化，请先在软件包库重新校验。");
+    }
+
+    private static String packageFileState(Path artifact) throws Exception {
+        Path directory = artifact.getParent();
+        Path content = directory.resolve("content");
+        MessageDigest state = MessageDigest.getInstance("SHA-256");
+        boolean unix = artifact.getFileSystem().supportedFileAttributeViews().contains("unix");
+        try {
+            addFileState(state, directory, artifact, unix);
+            addFileState(state, directory, directory.resolve("extracted.sha256"), unix);
+            Path supplied = directory.resolve("operator-manifest.json");
+            if (Files.exists(supplied, LinkOption.NOFOLLOW_LINKS))
+                addFileState(state, directory, supplied, unix);
+            try (var paths = Files.walk(content)) {
+                for (Path path : paths.sorted().toList()) addFileState(state, directory, path, unix);
+            }
+        } catch (IOException | UncheckedIOException missing) {
+            throw bad("离线包或解包文件无法读取，请在软件包库移除后重新上传。");
+        }
+        return HexFormat.of().formatHex(state.digest());
+    }
+
+    private static void addFileState(MessageDigest state, Path directory, Path path, boolean unix)
+            throws IOException {
+        var attrs = Files.readAttributes(path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+        if (!attrs.isDirectory() && !attrs.isRegularFile())
+            throw bad("介质包含不受支持的文件类型，请重新上传。");
+        Object changedAt = unix ? Files.getAttribute(path, "unix:ctime", LinkOption.NOFOLLOW_LINKS) : attrs.creationTime();
+        for (Object value : List.of(directory.relativize(path), attrs.isDirectory(), attrs.size(),
+                attrs.lastModifiedTime(), String.valueOf(attrs.fileKey()), changedAt)) {
+            state.update(value.toString().getBytes(StandardCharsets.UTF_8));
+            state.update((byte) 0);
+        }
+    }
+
+    private Map<String, Object> inspectContents(Map<String, Object> record, Path file, String digest) throws Exception {
         Map<String, Object> result = cleanRecord(record);
         result.put("sha256", digest);
         if ("backup".equals(record.get("kind"))
@@ -172,16 +294,19 @@ public final class MediaService {
         if (manifest == null || json.writeValueAsBytes(manifest).length > MAX_MANIFEST)
             throw bad("介质清单为空或超过 1MB 上限");
         Path file = getPath(record);
+        if (record.containsKey(FILE_STATE)) checkPackageFileState(record, file);
         String digest = ArchiveSupport.sha256(file);
         if (!digest.equals(record.get("sha256"))) throw bad("介质内容已改变，不能补充执行清单");
         Path content = extract(file, digest);
+        Map<String, Object> candidate = new LinkedHashMap<>(record);
+        candidate.remove("upgradeCompatibility");
         Map<String, Object> result;
         if ("plugin".equals(record.get("kind")))
             result = plugin(record, content, manifest, "operator");
         else
             result =
                     validatePackage(
-                            record,
+                            candidate,
                             locateRoot(content, manifest.get("packageRoot")),
                             manifest,
                             "operator");
@@ -192,6 +317,7 @@ public final class MediaService {
         OperationsFiles.writePrivate(
                 file.getParent().resolve("operator-manifest.json"),
                 json.writeValueAsBytes(normalized));
+        if ("package".equals(result.get("kind"))) result.put(FILE_STATE, packageFileState(file));
         result.put(
                 "revision",
                 record.get("revision") instanceof Number number ? number.longValue() + 1 : 1L);
@@ -303,11 +429,40 @@ public final class MediaService {
         return builtinPackage(record, root, Map.of());
     }
 
+    public Map<String, Object> packageDisplay(Map<String, Object> record) {
+        if (needsPackageVerification(record)) {
+            var pending = new LinkedHashMap<>(record);
+            pending.put("status", "待校验");
+            pending.put("validationMessage", "旧版入库的离线包需要补做一次校验。");
+            record = pending;
+        }
+        if (!DataEaseOfflinePackage.ADAPTER.equals(record.get("adapter")))
+            return record;
+        try {
+            Map<String, Object> result = new LinkedHashMap<>(record);
+            if (!record.containsKey("edition") || "enterprise".equals(record.get("edition"))
+                    && !record.containsKey("defaultServicePort")) {
+                Path content = getPath(record).getParent().resolve("content");
+                Path packageRoot = Path.of(text(record.get("contentRoot"))).normalize();
+                if (!packageRoot.startsWith(content)) return record;
+                result.putAll(DataEaseOfflinePackage.deploymentMetadata(packageRoot, text(record.get("version"))));
+            }
+            if ("enterprise".equals(result.get("edition")))
+                result.put("purposes", DataEaseOfflinePackage.managedEnterprisePurposes(result));
+            return result;
+        } catch (Exception unavailable) {
+            return record;
+        }
+    }
+
     private Map<String, Object> builtinPackage(
             Map<String, Object> record, Path root, Map<String, Object> supplied) throws Exception {
         Map<String, Object> manifest = DataEaseOfflinePackage.inspect(root, json);
-        if (supplied.containsKey("minimumUpgradeSource")) {
-            String minimum = version(supplied.get("minimumUpgradeSource"));
+        Map<?, ?> declaration = record.get("upgradeCompatibility") instanceof Map<?, ?> value ? value : Map.of();
+        Object recordedMinimum = Objects.equals(record.get("sha256"), declaration.get("sha256"))
+                ? declaration.get("minimumUpgradeSource") : null;
+        if (supplied.containsKey("minimumUpgradeSource") || recordedMinimum != null) {
+            String minimum = version(recordedMinimum == null ? supplied.get("minimumUpgradeSource") : recordedMinimum);
             if (!minimum.substring(0, 3)
                     .equals(String.valueOf(manifest.get("version")).substring(0, 3)))
                 throw bad("升级最低来源版本必须与离线包主版本一致");
@@ -325,7 +480,7 @@ public final class MediaService {
         result.put("installSupported", true);
         result.put("publisherVerified", false);
         result.put("validationBasis", "docker-save-metadata-and-all-file-sha256");
-        result.put("validationMessage", "已核对单机Compose介质的目录、镜像及驱动；平台使用内置MySQL适配器部署，完成后隔离验收。");
+        result.put("validationMessage", "已核对离线包的版本、镜像、部署配置及文件摘要。");
         return result;
     }
 
@@ -500,6 +655,12 @@ public final class MediaService {
         return path;
     }
 
+    public static String packageFileDigest(Map<String, Object> record, String relative) {
+        if (record.get("files") instanceof Map<?, ?> files
+                && files.get(relative) instanceof String digest && digest.matches("[a-f0-9]{64}")) return digest;
+        throw bad("离线包缺少分发文件的校验记录，请在软件包库重新校验。");
+    }
+
     private static String relative(String value) {
         if (value == null
                 || value.isBlank()
@@ -578,9 +739,11 @@ public final class MediaService {
                         "contentRoot",
                         "entrypoint",
                         "adapter",
+                        "edition",
                         "images",
                         "manifest",
                         "manifestSource",
+                        FILE_STATE,
                         "installSupported",
                         "validationMessage")) copy.remove(key);
         return copy;

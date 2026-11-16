@@ -62,9 +62,9 @@ public class DataEaseVersionValidator {
         for (var entry : services.entrySet()) {
             if (!(entry.getValue() instanceof Map<?, ?> service)
                     || !(service.get("image") instanceof String image)) continue;
-            String repository = image.substring(image.lastIndexOf('/') + 1).split(":")[0];
+            String repository = image.substring(image.lastIndexOf('/') + 1).split("[:@]", 2)[0];
             if (!"dataease".equals(entry.getKey()) && !repository.equals("dataease")
-                    && !repository.startsWith("dataease-")) continue;
+                    && (!repository.startsWith("dataease-") || repository.equals("dataease-sync-task"))) continue;
             if (found != null) throw new IllegalArgumentException("源端Compose包含多个DataEase应用");
             found = image;
         }

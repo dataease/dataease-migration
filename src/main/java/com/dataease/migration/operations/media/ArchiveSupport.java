@@ -27,9 +27,9 @@ public final class ArchiveSupport {
         return HexFormat.of().formatHex(digest.digest());
     }
 
-    public record TarIndex(Map<String, byte[]> metadata, Set<String> files) {}
+    public record TarIndex(Map<String, byte[]> metadata, Set<String> files, Long dockerLoadBytes) {}
 
-    /** Reads Docker-save metadata without unpacking image layers or executing any image. */
+    /** Indexes Docker-save entries and measures compressed layers without writing them to disk. */
     public static TarIndex imageIndex(Path archive) throws Exception {
         try (BufferedInputStream source = new BufferedInputStream(Files.newInputStream(archive))) {
             source.mark(2);
@@ -40,7 +40,8 @@ public final class ArchiveSupport {
                 Set<String> files = new HashSet<>();
                 Map<String, String> global = new HashMap<>(), next = Map.of();
                 String longName = null;
-                long total = 0, retained = 0;
+                long total = 0, retained = 0, expandedLayers = 0;
+                boolean measurable = true;
                 int entries = 0;
                 byte[] header = new byte[512];
                 while (true) {
@@ -52,7 +53,8 @@ public final class ArchiveSupport {
                         while ((value = input.read()) != -1)
                             if (value != 0 || ++trailing > 1024 * 1024)
                                 throw new IOException("镜像尾部异常");
-                        return new TarIndex(Map.copyOf(metadata), Set.copyOf(files));
+                        return new TarIndex(Map.copyOf(metadata), Set.copyOf(files),
+                                measurable ? 2 * total + expandedLayers : null);
                     }
                     verifyTarChecksum(header);
                     if (++entries > MAX_ENTRIES) throw new IOException("镜像条目数量过多");
@@ -99,6 +101,15 @@ public final class ArchiveSupport {
                             byte[] bytes = input.readNBytes((int) length);
                             if (bytes.length != length) throw new EOFException("镜像元数据不完整");
                             metadata.put(name, bytes);
+                            if (name.startsWith("blobs/sha256/")) {
+                                long expanded = expandedLayer(new ByteArrayInputStream(bytes), bytes.length, MAX_BYTES - expandedLayers);
+                                measurable &= expanded >= 0;
+                                expandedLayers += Math.max(0, expanded);
+                            }
+                        } else if (name.matches("blobs/sha256/[a-f0-9]{64}")) {
+                            long expanded = expandedLayer(input, length, MAX_BYTES - expandedLayers);
+                            measurable &= expanded >= 0;
+                            expandedLayers += Math.max(0, expanded);
                         } else skip(input, length);
                     } else throw new IOException("镜像归档含不支持的链接或特殊条目");
                     skip(input, padding(length));
@@ -106,6 +117,57 @@ public final class ArchiveSupport {
                     if (total > MAX_BYTES) throw new IOException("镜像体积超过上限");
                 }
             }
+        }
+    }
+
+    private static long expandedLayer(InputStream input, long length, long limit) throws IOException {
+        // Do not let a nested decompressor read into the next tar entry.
+        var entry = new FilterInputStream(input) {
+            long remaining = length;
+            @Override public int read() throws IOException {
+                if (remaining == 0) return -1;
+                int value = in.read();
+                if (value < 0) throw new EOFException("镜像层不完整");
+                remaining--;
+                return value;
+            }
+            @Override public int read(byte[] bytes, int offset, int count) throws IOException {
+                if (count == 0) return 0;
+                if (remaining == 0) return -1;
+                int read = in.read(bytes, offset, (int) Math.min(remaining, count));
+                if (read < 0) throw new EOFException("镜像层不完整");
+                remaining -= read;
+                return read;
+            }
+            @Override public long skip(long count) throws IOException {
+                long skipped = in.skip(Math.min(count, remaining));
+                remaining -= skipped;
+                return skipped;
+            }
+            @Override public int available() throws IOException {
+                return (int) Math.min(remaining, in.available());
+            }
+            @Override public void close() {}
+        };
+        try (var blob = new BufferedInputStream(entry)) {
+            blob.mark(4);
+            byte[] prefix = blob.readNBytes(4);
+            blob.reset();
+            if (prefix.length >= 2 && prefix[0] == 0x1f && prefix[1] == (byte) 0x8b) {
+                long expanded = 0;
+                try (var gzip = new GZIPInputStream(blob)) {
+                    byte[] buffer = new byte[64 * 1024];
+                    for (int read; (read = gzip.read(buffer)) != -1; ) {
+                        expanded += read;
+                        if (expanded > limit) throw new IOException("镜像层解压总量超过 50 GiB");
+                    }
+                }
+                skip(entry, entry.remaining);
+                return expanded;
+            }
+            skip(blob, length);
+            boolean zstd = Arrays.equals(prefix, new byte[]{0x28, (byte) 0xb5, 0x2f, (byte) 0xfd});
+            return zstd ? -1 : 0;
         }
     }
 

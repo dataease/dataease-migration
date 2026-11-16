@@ -33,9 +33,13 @@ export function DownloadRows({ items, onOpen, query, filter }) {
     <TableRegion label="下载任务"><table className="pd-table"><thead><tr><th>下载文件 / 来源</th><th>类型</th><th>下载进度</th><th>状态</th><th>速度 / 剩余时间</th><th>操作</th></tr></thead><tbody>
       {rows.map((item) => <tr key={item.id}>
         <td><strong>{item.fileName || (item.sourceLabel !== item.sourceHost ? item.sourceLabel : "未识别文件")}</strong><small>{item.sourceHost}</small></td>
-        <td>{kindName(item.kind)}</td><td><Progress item={item} /></td>
-        <td><Badge tone={item.state === "completed" ? "green" : item.state === "failed" ? "red" : active(item) ? "blue" : "gray"}>{labels[item.state]}</Badge><small>{item.usedThreads ? `${item.usedThreads} 线程` : "等待检查"}</small></td>
-        <td>{speed(item)}<small>{remaining(item)}</small></td>
+        <td>{kindName(item.kind)}</td>
+        <td>{item.state === "verifying" ? "文件已下载"
+          : item.state === "downloading" || item.receivedBytes > 0 ? <Progress item={item} /> : "—"}</td>
+        <td><Badge tone={item.state === "completed" ? "green" : item.state === "failed" ? "red" : active(item) ? "blue" : "gray"}>{active(item) && <span className="task-spinner" aria-hidden="true" />}{labels[item.state]}</Badge>
+          {item.state === "downloading" && item.usedThreads > 0 && <small>{item.usedThreads} 线程</small>}
+        </td>
+        <td>{speed(item)}{item.state === "downloading" && <small>{remaining(item)}</small>}</td>
         <td><button className="link" onClick={() => onOpen(item)}>查看详情</button></td>
       </tr>)}
     </tbody></table>{!rows.length && <div className="pd-empty">暂无下载任务</div>}</TableRegion>
@@ -77,7 +81,7 @@ export function OnlinePackageDialog({ defaultKind, onClose, onCreated }) {
       </details>
       <Notice>服务器支持时使用多线程和断点续传，否则单线程下载。下载完成后校验、去重入库，不自动安装。</Notice>
     </> : <>
-      <div className="pd-market-toolbar"><Field label="搜索插件" value={search} onChange={(e) => { setSearch(e.target.value); setAppId(""); setVersionId(""); }} placeholder="搜索名称或说明" /><Button disabled={loading} onClick={load}>{loading ? "读取中…" : "刷新市场"}</Button></div>
+      <div className="pd-market-toolbar"><Field label="搜索插件" value={search} onChange={(e) => { setSearch(e.target.value); setAppId(""); setVersionId(""); }} placeholder="搜索名称或说明" /><Button disabled={loading} onClick={load}>{loading && <span className="task-spinner" aria-hidden="true" />}{loading ? "读取中…" : "刷新市场"}</Button></div>
       <Field label="选择插件"><Select aria-label="选择插件" value={appId} onChange={(e) => { const id = e.target.value; setAppId(id); setVersionId(catalogue?.find((v) => v.id === id)?.versions[0]?.id || ""); }}>
         <option value="">{loading ? "正在读取应用市场" : "请选择插件"}</option>
         {(catalogue || []).filter((item) => `${item.name} ${item.description}`.toLowerCase().includes(search.toLowerCase())).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
@@ -109,9 +113,22 @@ export function DownloadDetailDialog({ item, onClose, onRefresh, onMedia }) {
     {item.state === "completed" && <Button primary onClick={() => onMedia(item.mediaId)}>查看软件包</Button>}
   </>}>
     {confirmation && <Notice tone="amber">{confirmation[0]}</Notice>}
-    <Facts rows={[["文件", item.fileName || "尚未识别"], ["类型", kindName(item.kind)], ["来源", item.sourceHost], ["状态", labels[item.state]], ["下载线程", item.usedThreads ? `${item.usedThreads} / 请求 ${item.threads}` : "等待检查"]]} />
-    <Progress item={item} />
-    <Facts rows={[["当前速度", speed(item)], ["预计剩余", remaining(item)], ["SHA-256", item.sha256 || item.expectedSha256 || "校验完成后显示"]]} />
+    <Facts rows={[["文件", item.fileName || "尚未识别"], ["类型", kindName(item.kind)], ["来源", item.sourceHost],
+      ...(!active(item) ? [["状态", labels[item.state]]] : [])]} />
+    {active(item) && (
+      <div className="wf-check-progress" role="status">
+        <strong><span className="task-spinner" aria-hidden="true" />{labels[item.state]}</strong>
+        {item.state === "verifying" && <span>文件已下载，正在校验内容并入库。</span>}
+      </div>
+    )}
+    {(item.state === "downloading" || (!active(item) && item.receivedBytes > 0)) && <Progress item={item} />}
+    {item.state === "downloading" && <Facts rows={[
+      ["当前速度", speed(item)], ["预计剩余", remaining(item)],
+      ["下载线程", item.usedThreads ? `${item.usedThreads} / 请求 ${item.threads}` : "—"],
+    ]} />}
+    {(item.sha256 || item.expectedSha256) && <Facts rows={[
+      [item.sha256 ? "SHA-256" : "预期 SHA-256", item.sha256 || item.expectedSha256],
+    ]} />}
     {item.transferNote && <Notice>{item.transferNote}</Notice>}
     {item.state === "completed" && <Notice>已完成下载并入库。软件包状态：{item.mediaStatus}。</Notice>}
     {item.error && <Notice tone="red">{item.error}</Notice>}

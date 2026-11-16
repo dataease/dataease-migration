@@ -22,6 +22,14 @@ import java.util.function.Consumer;
 
 @Service
 public class BackupService {
+    public static final String ORIGINAL_ENTERPRISE = "original-enterprise";
+
+    public static boolean canRebuild(Map<String, Object> backup) {
+        String mode = text(backup, "restoreMode", "");
+        return "整体备份".equals(backup.get("scope"))
+                && (mode.isBlank() || ORIGINAL_ENTERPRISE.equals(mode)
+                        && "pause".equals(backup.get("consistent")));
+    }
     private final Path root;
     private final byte[] key;
     private final ObjectMapper json;
@@ -68,6 +76,7 @@ public class BackupService {
             Map<String, String> c,
             String scope,
             boolean images,
+            boolean protection,
             Consumer<String> log)
             throws Exception {
         if (!Set.of("数据备份", "资源备份", "整体备份").contains(scope))
@@ -76,6 +85,16 @@ public class BackupService {
         boolean full = scope.equals("整体备份"),
                 data = !scope.equals("资源备份"),
                 resources = !scope.equals("数据备份");
+        boolean enterprise = ComposeManager.isManagedEnterprise(i);
+        boolean vendor = ComposeManager.isVendorEnterprise(i);
+        boolean stopped = "已停止".equals(i.get("status"));
+        if (protection || vendor && full && stopped) compose.verifyStopped(i, c);
+        String gatewayBinding = "";
+        if (vendor && full && stopped)
+            gatewayBinding = compose.gatewayBackupBinding(i, c, true);
+        boolean restorable = vendor && (!full || !gatewayBinding.isBlank());
+        if (protection && enterprise && !restorable)
+            throw new IllegalArgumentException("无法为当前企业版部署创建可还原的整体保护备份。");
         String id = UUID.randomUUID().toString();
         Path temp = Files.createTempDirectory(root, ".work-");
         Files.setPosixFilePermissions(temp, PosixFilePermissions.fromString("rwx------"));
@@ -83,12 +102,18 @@ public class BackupService {
         Files.createDirectories(payload);
         try {
             List<String> roots = List.of();
-            if (data) database.exportDatabase(i, c, payload, log);
+            if (data) {
+                log.accept("正在导出元数据库");
+                database.exportDatabase(i, c, payload, log);
+            }
             if (resources) {
-                roots = resourceRoots(i, c, full);
+                boolean archiveConfig = full && !vendor;
+                log.accept("正在归档资源文件" + (!gatewayBinding.isBlank() ? "与已停止的网关状态"
+                        : archiveConfig ? "与部署配置" : ""));
+                roots = resourceRoots(i, c, archiveConfig, !gatewayBinding.isBlank());
                 if (roots.isEmpty()) throw new IllegalArgumentException("安装目录未发现可备份资源");
                 archiveResources(i, c, roots, payload.resolve("resources.tar.gz"));
-                log.accept("已归档并验证资源与部署配置");
+                log.accept("已归档并验证资源文件" + (!gatewayBinding.isBlank() ? "与网关状态" : ""));
             }
             Map<String, Object> manifest = new LinkedHashMap<>();
             manifest.put("formatVersion", 1);
@@ -96,23 +121,35 @@ public class BackupService {
             manifest.put("kind", "backup");
             manifest.put("name", text(i, "name", "DataEase") + " · " + scope);
             manifest.put("scope", scope);
+            if (enterprise) {
+                manifest.put("restoreMode", restorable ? ORIGINAL_ENTERPRISE : "manual");
+                if (!gatewayBinding.isBlank()) {
+                    compose.verifyStopped(i, c);
+                    if (!roots.contains(ComposeManager.ETCD_DATA)
+                            || !gatewayBinding.equals(compose.gatewayBackupBinding(i, c, true)))
+                        throw new IllegalArgumentException("备份期间企业版网关配置或 etcd 挂载发生变化，请重试。");
+                    manifest.put("gatewayBinding", gatewayBinding);
+                }
+            }
             for (String field : List.of("version", "arch", "dbType"))
                 manifest.put(field, i.get(field));
             if (data) manifest.put("sharedEngineRoute", SharedEngineConfiguration.snapshotRoute(c));
             String databaseIdentity = "";
-            try {
-                databaseIdentity = identity(i, c);
-            } catch (Exception failure) {
-                if (data) throw failure;
+            if (data) databaseIdentity = identity(i, c);
+            else if (!enterprise) {
+                try { databaseIdentity = identity(i, c); }
+                catch (Exception unavailable) { /* A resource backup does not require database access. */ }
             }
             manifest.put("databaseIdentity", databaseIdentity);
             manifest.put("instanceId", i.get("id"));
             manifest.put("instanceName", i.get("name"));
             manifest.put("instanceSnapshot", snapshot(i));
+            if (restorable && i.containsKey("deploymentId"))
+                manifest.put("deploymentId", i.get("deploymentId"));
             manifest.put("environmentConfig", i.getOrDefault("environmentConfig", Map.of()));
             manifest.put("recoveryPoint", Instant.now().toString());
             manifest.put("date", Instant.now().toString());
-            manifest.put("consistent", text(i, "status", "").equals("已停止") ? "pause" : "online");
+            manifest.put("consistent", stopped ? "pause" : "online");
             manifest.put("resourceRoots", roots);
             manifest.put("mirror", false);
             manifest.put("encrypted", true);
@@ -120,7 +157,7 @@ public class BackupService {
             manifest.put("storageHost", "operations-platform");
             manifest.put("storageLabel", "运维平台备份库（物理位置待确认）");
             manifest.put("offsite", null);
-            manifest.put("coverage", coverage(scope, roots));
+            manifest.put("coverage", coverage(scope, roots, enterprise, vendor));
             Map<String, String> checksums = new LinkedHashMap<>();
             try (var files = Files.walk(payload)) {
                 for (Path file : files.filter(Files::isRegularFile).toList())
@@ -128,22 +165,73 @@ public class BackupService {
             }
             manifest.put("files", checksums);
             json.writeValue(payload.resolve("manifest.json").toFile(), manifest);
+            log.accept("正在打包、加密并校验备份归档");
             Path zip = temp.resolve("payload.zip");
             ArchiveSupport.zip(payload, zip);
             Path artifact = root.resolve(id + ".debackup");
-            encrypt(zip, artifact);
             Map<String, Object> record = new LinkedHashMap<>(manifest);
-            record.put("artifactPath", artifact.toString());
-            record.put("sha256", ArchiveSupport.sha256(artifact));
-            record.put("sizeBytes", Files.size(artifact));
-            record.put("size", Files.size(artifact) + " B");
-            record.put("status", "已校验");
-            verify(record);
+            try {
+                encrypt(zip, artifact);
+                record.put("artifactPath", artifact.toString());
+                record.put("sha256", ArchiveSupport.sha256(artifact));
+                record.put("sizeBytes", Files.size(artifact));
+                record.put("size", Files.size(artifact) + " B");
+                record.put("status", "已校验");
+                verify(record);
+            } catch (Exception failure) {
+                try { Files.deleteIfExists(artifact); }
+                catch (IOException cleanup) { failure.addSuppressed(cleanup); }
+                throw failure;
+            }
             log.accept("备份已完成AES-GCM加密、文件清单和SHA-256校验");
             return record;
         } finally {
             ArchiveSupport.deleteTree(temp);
         }
+    }
+
+    record UpgradeFootprint(long resources, long database, String databaseDirectory, Path repository) {
+        long repositoryBytes() {
+            // Verification can hold encrypted, decrypted and expanded copies at once.
+            return Math.multiplyExact(Math.addExact(resources, database), 5);
+        }
+    }
+
+    UpgradeFootprint upgradeFootprint(Map<String, Object> instance, Map<String, String> credentials) throws Exception {
+        boolean vendor = ComposeManager.isVendorEnterprise(instance);
+        var roots = resourceRoots(instance, credentials, !vendor, vendor);
+        if (roots.isEmpty()) throw new IllegalArgumentException("无法确认升级保护备份的资源范围。");
+        roots.forEach(BackupService::safeRelative);
+        String arguments = String.join(" ", roots.stream().map(HostCommands::quote).toList());
+        String size = host.capture(instance, credentials, "cd " + quote(path(text(instance, "path", "")))
+                + " && du -sb --total -- " + arguments);
+        long resources = Math.addExact(Long.parseLong(size.lines().reduce((a, b) -> b).orElseThrow().split("\\s+")[0]),
+                16 * UpgradeCapacity.MIB);
+        long db;
+        try (var connection = database.connect(instance, credentials); var statement = connection.createStatement()) {
+            statement.setQueryTimeout(15);
+            try (var rows = statement.executeQuery("SELECT COALESCE(SUM(DATA_LENGTH), 0), "
+                    + "COALESCE(SUM(INDEX_LENGTH), 0) FROM information_schema.tables WHERE TABLE_SCHEMA=DATABASE()")) {
+                if (!rows.next()) throw new IllegalArgumentException("无法估算 MySQL 保护备份大小。");
+                db = Math.addExact(Math.multiplyExact(rows.getLong(1), 2), rows.getLong(2));
+            }
+        }
+        long databaseBytes = Math.addExact(db, 128 * UpgradeCapacity.MIB);
+        String databaseService = text(instance, "databaseService", "");
+        String id = databaseService.isBlank() ? "" : compose.containerId(instance, credentials, databaseService);
+        String directory = "";
+        if (!id.isBlank() && compose.container(instance, credentials, id).get("Mounts") instanceof List<?> mounts) {
+            for (Object value : mounts) {
+                if (value instanceof Map<?, ?> mount && "/var/lib/mysql".equals(mount.get("Destination"))
+                        && mount.get("Source") instanceof String source) {
+                    directory = path(source.startsWith("/host_mnt/") ? source.substring("/host_mnt".length()) : source);
+                    break;
+                }
+            }
+        }
+        if (directory.isBlank())
+            throw new IllegalArgumentException("无法核对负责回退的 MySQL 数据卷所在文件系统。");
+        return new UpgradeFootprint(resources, databaseBytes, directory, root);
     }
 
     public Map<String, Object> verify(Map<String, Object> record) throws Exception {
@@ -178,13 +266,19 @@ public class BackupService {
         } finally { ArchiveSupport.deleteTree(temporary); }
     }
 
-    public void validateRestore(
+    public Map<String, Object> validateRestore(
             Map<String, Object> record, Map<String, Object> target, Map<String, String> credentials)
             throws Exception {
         Path temporary = Files.createTempDirectory(root, ".restore-check-");
         try {
             Map<String, Object> manifest = unpack(record, temporary);
             validateIdentity(manifest, target, credentials, record.containsKey("importedAt"));
+            boolean approvedRollback = Boolean.TRUE.equals(target.get("vendorProtectionRollback"));
+            if (ORIGINAL_ENTERPRISE.equals(manifest.get("restoreMode"))
+                    && ((!Objects.equals(manifest.get("version"), target.get("version")) && !approvedRollback)
+                            || !Objects.equals(manifest.get("arch"), target.get("arch"))
+                            || !Objects.equals(manifest.get("dbType"), target.get("dbType"))))
+                throw new IllegalArgumentException("企业版恢复目标须与备份的 DataEase 版本、架构和数据库一致。");
             if (!"资源备份".equals(manifest.get("scope"))) {
                 SharedEngineConfiguration.restoreRoute(manifest, target, credentials);
                 if (!text(target, "applicationService", "").isBlank()
@@ -202,6 +296,7 @@ public class BackupService {
                                 .filter(relative -> relative.startsWith("data/"))
                                 .toList());
             }
+            return manifest;
         } finally {
             ArchiveSupport.deleteTree(temporary);
         }
@@ -223,6 +318,9 @@ public class BackupService {
                     || !Objects.equals(manifest.get("dbType"), target.get("dbType")))
                 throw new IllegalArgumentException("还原目标版本、架构和数据库必须与备份一致");
             validateIdentity(manifest, target, c, record.containsKey("importedAt"));
+            if (ComposeManager.isManagedEnterprise(target)) compose.verifyStopped(target, c);
+            boolean originalEnterprise = ORIGINAL_ENTERPRISE.equals(manifest.get("restoreMode"));
+            boolean rebuildGateway = originalEnterprise && Boolean.TRUE.equals(target.get("freshRestoreTarget"));
             com.dataease.migration.model.DatabaseConnection previousRoute =
                     scope.equals("资源备份") ? null
                             : SharedEngineConfiguration.restoreRoute(manifest, target, c);
@@ -243,8 +341,10 @@ public class BackupService {
                 ArchiveSupport.extract(temp.resolve("resources.tar.gz"), extracted);
                 for (String relative : (List<String>) manifest.get("resourceRoots")) {
                     safeRelative(relative);
-                    if (relative.startsWith("data/")) selected.add(relative);
-                    else if (relative.equals("conf") || relative.equals("config")) {
+                    if (relative.startsWith("data/") && !(rebuildGateway && Path.of(relative).normalize()
+                            .startsWith(ComposeManager.ETCD_DATA)))
+                        selected.add(relative);
+                    else if (!originalEnterprise && (relative.equals("conf") || relative.equals("config"))) {
                         try (var files = Files.walk(extracted.resolve(relative))) {
                             for (Path file : files.filter(Files::isRegularFile).toList()) {
                                 String item = extracted.relativize(file).toString();
@@ -260,35 +360,37 @@ public class BackupService {
                 }
                 validateResourceBounds(
                         target, c, selected); // BEFORE any database DROP or file deletion.
-                for (String file :
-                        List.of(
-                                "conf/application.yml",
-                                "config/application.yml",
-                                "conf/application.yaml",
-                                "config/application.yaml",
-                                "conf/application-mysql.yml",
-                                "config/application-mysql.yml",
-                                "conf/application-mysql.yaml",
-                                "config/application-mysql.yaml"))
-                    patchDatabase(extracted.resolve(file), target, runtime);
+                for (String relative : selected)
+                    if (!Files.exists(extracted.resolve(relative)))
+                        throw new IllegalArgumentException("备份缺少清单列出的资源，未执行覆盖。");
+                if (originalEnterprise && scope.equals("整体备份")
+                        && !Files.isRegularFile(extracted.resolve(ComposeManager.ETCD_DATA + "/data/member/snap/db")))
+                    throw new IllegalArgumentException("备份缺少企业版 etcd 状态，未执行覆盖。");
+                if (!originalEnterprise) {
+                    for (String file : List.of("conf/application.yml", "config/application.yml",
+                            "conf/application.yaml", "config/application.yaml", "conf/application-mysql.yml",
+                            "config/application-mysql.yml", "conf/application-mysql.yaml", "config/application-mysql.yaml"))
+                        patchDatabase(extracted.resolve(file), target, runtime);
+                }
             }
             if (!scope.equals("资源备份")) {
                 // Data-only restores also need the target application's actual runtime route.
                 if (scope.equals("数据备份")) compose.inspect(target, runtime);
                 database.restoreDatabase(target, c, temp, log);
-                new SharedEngineConfiguration(json).relocate(previousRoute, target, runtime);
+                new SharedEngineConfiguration(json, database).relocate(previousRoute, target, runtime);
             }
             if (!scope.equals("数据备份")) replaceResources(target, c, extracted, selected, log);
+            if (rebuildGateway) log.accept("已保留目标新建的网关配置。隔离启动时将初始化原厂网关路由。");
             log.accept("已还原备份内容；保留目标运行端数据库连接及数据库卷，目标尚未开放业务访问");
         } finally {
             ArchiveSupport.deleteTree(temp);
         }
     }
 
-    private static String identity(Map<String, Object> instance, Map<String, String> credentials)
+    private String identity(Map<String, Object> instance, Map<String, String> credentials)
             throws Exception {
         if (!text(instance, "dbType", "MySQL").equals("MySQL")) return "";
-        try (java.sql.Connection connection = DatabaseArchive.connect(instance, credentials);
+        try (java.sql.Connection connection = database.connect(instance, credentials);
                 java.sql.Statement statement = connection.createStatement();
                 java.sql.ResultSet result =
                         statement.executeQuery("SELECT @@server_uuid,DATABASE()")) {
@@ -302,6 +404,12 @@ public class BackupService {
             Map<String, Object> target,
             Map<String, String> credentials, boolean imported)
             throws Exception {
+        String mode = text(manifest, "restoreMode", "");
+        if ("manual".equals(mode))
+            throw new IllegalArgumentException("此备份仅供校验和导出。请暂停原厂企业版实例后重新创建整体备份。");
+        boolean freshTarget = Boolean.TRUE.equals(target.get("freshRestoreTarget"));
+        if (freshTarget && !"整体备份".equals(manifest.get("scope")))
+            throw new IllegalArgumentException("未安装的实例只能从整体备份重建。");
         boolean rehearsal =
                 "rehearsal"
                         .equals(
@@ -310,11 +418,41 @@ public class BackupService {
                                         "restorePurpose",
                                         text(target, "operationPurpose", "")));
         Map<?, ?> snapshot = manifest.get("instanceSnapshot") instanceof Map<?, ?> s ? s : Map.of();
-        boolean sameId = Objects.equals(manifest.get("instanceId"), target.get("id"));
+        boolean sameId = !freshTarget && Objects.equals(manifest.get("instanceId"), target.get("id"));
         String originalHost = text(snapshot, "hostIdentity", "");
+        if (ORIGINAL_ENTERPRISE.equals(mode)) {
+            if (!ComposeManager.isVendorEnterprise(target)
+                    || !ComposeManager.VENDOR_ENTERPRISE_ADAPTER.equals(snapshot.get("deploymentAdapter")))
+                throw new IllegalArgumentException("企业版备份需要匹配的原厂企业版目标。");
+            if (freshTarget) {
+                String targetHost = text(target, "hostIdentity", "");
+                String sourceMachine = text(snapshot, "machineIdentity", "");
+                String targetMachine = text(target, "machineIdentity", "");
+                if (!canRebuild(manifest) || !text(manifest, "gatewayBinding", "").matches("sha256:[0-9a-f]{64}/[0-9a-f]{64}")
+                        || originalHost.isBlank() || targetHost.isBlank() || targetMachine.isBlank()
+                        || originalHost.equals(targetHost)
+                        || sourceMachine.equals(targetMachine)
+                        || text(snapshot, "host", "").equalsIgnoreCase(text(target, "host", "")))
+                    throw new IllegalArgumentException("企业版重建需要暂停写入后创建的整体备份，以及独立的空服务器。");
+            } else {
+                if (!sameId || originalHost.isBlank() || !originalHost.equals(text(target, "hostIdentity", ""))
+                        || !text(snapshot, "path", "").equals(text(target, "path", ""))
+                        || !text(snapshot, "composeProject", "").equals(text(target, "composeProject", ""))
+                        || !Objects.equals(manifest.get("deploymentId"), target.get("deploymentId")))
+                    throw new IllegalArgumentException("请选择原部署，或使用整体备份在空服务器重建。");
+                if ("整体备份".equals(manifest.get("scope"))
+                        && (!"pause".equals(manifest.get("consistent"))
+                                || !compose.gatewayBackupBinding(target, credentials, false)
+                                        .equals(manifest.get("gatewayBinding"))))
+                    throw new IllegalArgumentException("原部署的 etcd 镜像或网关配置已变化，不能覆盖。");
+            }
+        } else if (!mode.isBlank() || ComposeManager.isManagedEnterprise(target)
+                || text(snapshot, "deploymentAdapter", "").startsWith("dataease-enterprise-")) {
+            throw new IllegalArgumentException("备份的还原方式与目标部署不兼容。");
+        }
         // A fresh platform assigns new record IDs. Rebind only an imported backup whose
         // physical Docker host, exact deployment directory and live MySQL identity all match.
-        if (!sameId && imported && !originalHost.isBlank()
+        if (!freshTarget && !sameId && imported && !originalHost.isBlank()
                 && originalHost.equals(text(target, "hostIdentity", ""))
                 && path(text(snapshot, "path", "")).equals(path(text(target, "path", "")))
                 && !text(manifest, "databaseIdentity", "").isBlank()
@@ -323,7 +461,7 @@ public class BackupService {
                 && text(manifest, "databaseIdentity", "").equals(identity(target, credentials)))
             sameId = true;
 
-        if (!sameId
+        if (!sameId && !freshTarget
                 && !originalHost.isBlank()
                 && originalHost.equals(text(target, "hostIdentity", ""))) {
             Path originalPath = Path.of(path(text(snapshot, "path", ""))),
@@ -343,13 +481,18 @@ public class BackupService {
             if (!Boolean.TRUE.equals(target.get("protectionRecovery")) || !sameId
                     || !"整体备份".equals(manifest.get("scope")))
                 throw new IllegalArgumentException("缺失元数据库仅允许原失败任务绑定的整体保护恢复");
-            var observed = DatabaseArchive.observe(target, credentials);
+            var observed = database.observe(target, credentials);
             if (!observed.identity().equals(original)
                     || !observed.identity().equals(text(target, "databaseIdentity", "")))
                 throw new IllegalArgumentException("缺失数据库的实际MySQL服务与原保护备份不一致");
             target.put("metadataDatabasePresent", observed.present());
             actualIdentity = observed.identity();
         } else actualIdentity = identity(target, credentials);
+        if (!text(target, "databaseIdentity", "").isBlank()
+                && !text(target, "databaseIdentity", "").equals(actualIdentity))
+            throw new IllegalArgumentException("恢复目标的实际数据库与登记记录不一致，未执行覆盖。");
+        if (ORIGINAL_ENTERPRISE.equals(mode) && !freshTarget && !original.isBlank() && !original.equals(actualIdentity))
+            throw new IllegalArgumentException("企业版原部署的实际数据库身份已变化，未执行覆盖。");
         if (!original.isBlank() && original.equals(actualIdentity) && !sameId)
             throw new IllegalArgumentException("恢复目标实际指向备份来源数据库，已阻止异实例覆盖；请选择独立数据库");
     }
@@ -410,7 +553,7 @@ public class BackupService {
     public void validateMigrationResources(Map<String, Object> source, Map<String, String> sc,
             Map<String, Object> target, Map<String, String> tc) throws Exception {
         List<String> resources = List.of("i18n", "font", "exportData", "map", "geo",
-                "appearance", "static-resource", "excel", "plugin").stream()
+                "appearance", "static-resource", "plugin").stream()
                 .map(name -> "data/" + name).toList();
         // Migration copies and deletes a fixed set of resource directories. They must never
         // overlap a MySQL bind mount, even when a full backup excludes that database directory.
@@ -434,7 +577,8 @@ public class BackupService {
     }
 
     @SuppressWarnings("unchecked")
-    private List<String> resourceRoots(Map<String, Object> i, Map<String, String> c, boolean full)
+    private List<String> resourceRoots(Map<String, Object> i, Map<String, String> c,
+            boolean includeConfiguration, boolean includeEtcd)
             throws Exception {
         String path = path(text(i, "path", ""));
         host.capture(
@@ -442,6 +586,7 @@ public class BackupService {
                 c,
                 "test -d " + quote(path + "/data") + " && test ! -L " + quote(path + "/data"));
         Set<String> excluded = new HashSet<>();
+        if (!includeEtcd && ComposeManager.isManagedEnterprise(i)) excluded.add(ComposeManager.ETCD_DATA);
         for (Path protectedPath : databaseVolumePaths(i, c)) {
             String source = protectedPath.toString();
             if (source.equals(path + "/data"))
@@ -469,10 +614,12 @@ public class BackupService {
         }
         List<String> configFiles =
                 new ArrayList<>(List.of("conf", "config", ".env", "install.conf"));
+        if (ComposeManager.isVendorEnterprise(i))
+            configFiles.addAll(List.of("apisix/apisix_conf", "apisix/plugins", "bin/mysql"));
         if (i.get("composeFiles") instanceof List<?> composeFiles)
             for (Object file : composeFiles) configFiles.add(String.valueOf(file));
         else configFiles.add(text(i, "composeFile", "docker-compose.yml"));
-        if (full)
+        if (includeConfiguration)
             for (String relative : configFiles) {
                 String exists =
                         host.capture(
@@ -538,17 +685,14 @@ public class BackupService {
         String remote = "/tmp/deops-restore-" + UUID.randomUUID();
         Path tar = Files.createTempFile("deops-restore-", ".tar.gz");
         try {
-            Process p =
-                    new ProcessBuilder(
-                                    "tar",
-                                    "--no-xattrs",
-                                    "-C",
-                                    extracted.toString(),
-                                    "-czf",
-                                    tar.toString(),
-                                    ".")
-                            .redirectErrorStream(true)
-                            .start();
+            var archive = new ArrayList<>(List.of("tar", "--no-xattrs", "-C", extracted.toString(),
+                    "-czf", tar.toString()));
+            if (roots.isEmpty()) archive.addAll(List.of("-T", "/dev/null"));
+            else {
+                archive.add("--");
+                archive.addAll(roots);
+            }
+            Process p = new ProcessBuilder(archive).redirectErrorStream(true).start();
             if (!p.waitFor(10, java.util.concurrent.TimeUnit.MINUTES) || p.exitValue() != 0)
                 throw new IOException("还原资源重新打包失败");
             host.run(i, c, "umask 077; mkdir -p " + quote(remote), line -> {});
@@ -563,7 +707,14 @@ public class BackupService {
                             + " -xzf "
                             + quote(remote + "/resources.tar.gz"),
                     line -> {});
-            List<String> current = resourceRoots(i, c, false);
+            if (roots.contains(ComposeManager.ETCD_DATA) && ComposeManager.isVendorEnterprise(i)) {
+                String etcd = quote(remote + "/content/" + ComposeManager.ETCD_DATA + "/data");
+                host.run(i, c, "chown -R 1001:0 -- " + etcd
+                        + " && find " + etcd + " -type d -exec chmod 700 -- {} +"
+                        + " && find " + etcd + " -type f -exec chmod 600 -- {} +"
+                        + " && chmod 777 -- " + quote(remote + "/content/" + ComposeManager.ETCD_DATA), line -> {});
+            }
+            List<String> current = resourceRoots(i, c, false, false);
             Set<String> remove = new LinkedHashSet<>(current);
             remove.addAll(roots);
             for (String relative : remove) {
@@ -738,7 +889,9 @@ public class BackupService {
         if (!importedDigest.equals(text(record, "sha256", "")))
             throw new IllegalArgumentException("导入备份文件摘要已变化。");
         if (BackupCipher.portable(file)) {
-            Path temp = Files.createTempDirectory(root, ".import-");
+            // The verified archive must be replaced atomically even when backups and media
+            // are on separate mounted volumes.
+            Path temp = Files.createTempDirectory(file.getParent(), ".import-");
             Files.setPosixFilePermissions(temp, PosixFilePermissions.fromString("rwx------"));
             try {
                 Path plain = temp.resolve("payload.zip"), managed = temp.resolve("managed.debackup");
@@ -791,15 +944,18 @@ public class BackupService {
                         "composeFile",
                         "composeFiles",
                         "composeProject",
+                        "deploymentAdapter",
                         "serviceCount",
                         "databaseIdentity",
                         "hostIdentity",
+                        "machineIdentity",
                         "environmentPurpose"))
             if (i.containsKey(field)) result.put(field, i.get(field));
         return result;
     }
 
-    private static List<Map<String, Object>> coverage(String scope, List<String> roots) {
+    private static List<Map<String, Object>> coverage(String scope, List<String> roots,
+            boolean enterprise, boolean vendor) {
         List<Map<String, Object>> rows = new ArrayList<>();
         boolean full = scope.equals("整体备份");
         for (String name : List.of("metadata", "engine", "files", "plugins", "config")) {
@@ -807,7 +963,7 @@ public class BackupService {
                     switch (name) {
                         case "metadata", "engine" -> !scope.equals("资源备份");
                         case "files", "plugins" -> !scope.equals("数据备份");
-                        default -> full;
+                        default -> full && !vendor;
                     };
             rows.add(
                     Map.of(
@@ -822,18 +978,27 @@ public class BackupService {
                                             "files",
                                             "资源文件与驱动",
                                             "plugins",
-                                            "插件文件与登记信息",
+                                            "插件文件",
                                             "config",
                                             "部署配置与恢复密钥")
                                     .get(name),
                             "mode",
                             included ? "included" : "excluded",
                             "required",
-                            full,
+                            full && (!vendor || !name.equals("config")),
                             "location",
                             "备份归档清单",
                             "detail",
-                            name.equals("engine") ? "首版仅支持与元数据库共库的数据引擎" : "按归档实际内容核验"));
+                            name.equals("engine") ? "仅包含共库引擎，外部数据源需单独备份"
+                                    : vendor && name.equals("config") ? "还原时保留原部署配置"
+                                    : "按归档实际内容核验"));
+        }
+        if (enterprise && full) {
+            boolean state = roots.contains(ComposeManager.ETCD_DATA);
+            rows.add(Map.of("id", "gateway", "name", "APISIX 网关状态",
+                    "mode", state ? "included" : "excluded", "required", vendor,
+                    "detail", state ? "原部署可恢复 etcd 状态。异机重建时初始化原厂路由，自定义路由和证书需重新配置。"
+                            : "未归档 etcd 状态。需要还原时请选择暂停应用写入。"));
         }
         return rows;
     }

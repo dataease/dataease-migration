@@ -1,6 +1,8 @@
 package com.dataease.migration.service;
 
 import com.dataease.migration.model.ServerInfo;
+import com.dataease.migration.operations.core.OperationsFiles;
+import com.dataease.migration.operations.core.OperationsProperties;
 import com.jcraft.jsch.*;
 
 import org.springframework.beans.factory.annotation.Value;
@@ -11,16 +13,23 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.security.MessageDigest;
 import java.util.Base64;
+import java.util.HexFormat;
+import java.util.Locale;
 import java.util.concurrent.*;
 import java.util.function.Consumer;
+import java.util.function.LongConsumer;
 
 @Component
 public class SshCommandExecutor {
     private final int connectTimeoutMillis;
+    private final Path pinnedHosts;
     private int commandTimeoutMillis = 3600000;
 
-    public SshCommandExecutor(@Value("${migration.ssh.connect-timeout-millis:30000}") int timeout) {
+    public SshCommandExecutor(
+            @Value("${migration.ssh.connect-timeout-millis:30000}") int timeout,
+            OperationsProperties properties) {
         connectTimeoutMillis = timeout;
+        pinnedHosts = properties.dataDirectory().resolve("ssh-hosts");
     }
 
     @Value("${migration.ssh.command-timeout-millis:3600000}")
@@ -97,8 +106,42 @@ public class SshCommandExecutor {
         return capture(server, "cat " + ShellEscaper.quote(path));
     }
 
+    public record LocalForward(int port, Session session) implements AutoCloseable {
+        @Override public void close() { session.disconnect(); }
+    }
+
+    public LocalForward forward(ServerInfo server, String destination, int port) throws Exception {
+        Session session = connect(server);
+        try {
+            int local = session.setPortForwardingL("127.0.0.1", 0, destination, port);
+            return new LocalForward(local, session);
+        } catch (Exception failure) {
+            session.disconnect();
+            throw failure;
+        }
+    }
+
     public void upload(ServerInfo server, Path local, String remote) throws Exception {
         transfer(server, c -> c.put(local.toString(), remote));
+    }
+
+    public void upload(ServerInfo server, Path local, String remote, LongConsumer progress) throws Exception {
+        transfer(server, c -> c.put(local.toString(), remote, new SftpProgressMonitor() {
+            private long transferred;
+            private long lastUpdate = System.nanoTime();
+
+            @Override public void init(int operation, String source, String destination, long size) {}
+            @Override public boolean count(long bytes) {
+                transferred += bytes;
+                long now = System.nanoTime();
+                if (now - lastUpdate >= TimeUnit.SECONDS.toNanos(2)) {
+                    lastUpdate = now;
+                    progress.accept(transferred);
+                }
+                return !Thread.currentThread().isInterrupted();
+            }
+            @Override public void end() {}
+        }));
     }
 
     public void download(ServerInfo server, String remote, Path local) throws Exception {
@@ -115,27 +158,22 @@ public class SshCommandExecutor {
                     server.passphrase() == null
                             ? null
                             : server.passphrase().getBytes(StandardCharsets.UTF_8));
-        if (server.hostKey() != null && !server.hostKey().isBlank()) {
-            String pin = server.hostKey().trim();
+        boolean explicitPin = server.hostKey() != null && !server.hostKey().isBlank();
+        boolean keyAuth = server.privateKey() != null && !server.privateKey().isBlank();
+        Path known = Path.of(System.getProperty("user.home"), ".ssh", "known_hosts");
+        if (Files.isRegularFile(known)) jsch.setKnownHosts(known.toString());
+        HostKeyRepository knownHosts = jsch.getHostKeyRepository();
+        Path pinFile = pinnedHosts.resolve(
+                HexFormat.of().formatHex(sha256((server.host().toLowerCase(Locale.ROOT)
+                        + ":" + server.port()).getBytes(StandardCharsets.UTF_8))));
+        String savedPin = storedPin(pinFile);
+        String pin = explicitPin ? server.hostKey().trim() : savedPin;
+        if (!pin.isEmpty() || keyAuth) {
             jsch.setHostKeyRepository(
                     new HostKeyRepository() {
                         public int check(String host, byte[] key) {
-                            try {
-                                String fingerprint =
-                                        "SHA256:"
-                                                + Base64.getEncoder()
-                                                        .withoutPadding()
-                                                        .encodeToString(
-                                                                MessageDigest.getInstance("SHA-256")
-                                                                        .digest(key));
-                                return MessageDigest.isEqual(
-                                                fingerprint.getBytes(StandardCharsets.UTF_8),
-                                                pin.getBytes(StandardCharsets.UTF_8))
-                                        ? OK
-                                        : CHANGED;
-                            } catch (Exception e) {
-                                return CHANGED;
-                            }
+                            if (pin.isEmpty()) return knownHosts.check(host, key) == CHANGED ? CHANGED : OK;
+                            return fingerprint(key).equals(pin) ? OK : CHANGED;
                         }
 
                         public void add(HostKey key, UserInfo ui) {}
@@ -156,13 +194,8 @@ public class SshCommandExecutor {
                             return new HostKey[0];
                         }
                     });
-        } else {
-            Path known = Path.of(System.getProperty("user.home"), ".ssh", "known_hosts");
-            if (!Files.isRegularFile(known))
-                throw new IllegalArgumentException(
-                        "缺少 SSH 主机密钥。请核对服务器 SHA256 指纹后填写 hostKey，或由管理员配置 known_hosts。");
-            jsch.setKnownHosts(known.toString());
-        }
+        } else if (!Files.isRegularFile(known))
+            throw new IllegalArgumentException("首次使用密码连接时，请填写 SSH 主机指纹或配置 known_hosts。");
         Session session = jsch.getSession(server.username(), server.host(), server.port());
         if (server.password() != null) session.setPassword(server.password());
         session.setConfig("StrictHostKeyChecking", "yes");
@@ -172,11 +205,42 @@ public class SshCommandExecutor {
         session.setServerAliveCountMax(3);
         try {
             session.connect(connectTimeoutMillis);
+            if (keyAuth && !explicitPin)
+                pinAfterAuthentication(pinFile, fingerprint(Base64.getDecoder().decode(session.getHostKey().getKey())));
             return session;
         } catch (Exception e) {
             session.disconnect();
+            if (e instanceof JSchException && e.getMessage() != null
+                    && (e.getMessage().contains("HostKey has been changed") || e.getMessage().contains("reject HostKey")))
+                throw new IllegalStateException("SSH 主机指纹与已记录值不一致，请核对服务器身份和指纹。", e);
             throw new IllegalStateException("SSH 连接失败，请核对主机密钥、地址及认证配置", e);
         }
+    }
+
+    private static byte[] sha256(byte[] data) {
+        try {
+            return MessageDigest.getInstance("SHA-256").digest(data);
+        } catch (java.security.NoSuchAlgorithmException unavailable) {
+            throw new IllegalStateException(unavailable);
+        }
+    }
+
+    private static String fingerprint(byte[] key) {
+        return "SHA256:" + Base64.getEncoder().withoutPadding().encodeToString(sha256(key));
+    }
+
+    private static String storedPin(Path file) throws IOException {
+        if (!Files.exists(file, LinkOption.NOFOLLOW_LINKS)) return "";
+        if (!Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS))
+            throw new IOException("SSH 指纹记录文件无效");
+        return Files.readString(file).strip();
+    }
+
+    private synchronized void pinAfterAuthentication(Path file, String observed) throws IOException {
+        String existing = storedPin(file);
+        if (existing.equals(observed)) return;
+        if (!existing.isEmpty()) throw new IOException("SSH 主机指纹已变化");
+        OperationsFiles.writePrivate(file, observed.getBytes(StandardCharsets.UTF_8));
     }
 
     private void transfer(ServerInfo server, SftpOperation operation) throws Exception {

@@ -34,9 +34,13 @@ final class ContainerApplicationHttp implements AutoCloseable {
         Map<String, Object> services = (Map<String, Object>) cfg.get("services");
         Map<String, Object> app = (Map<String, Object>) services.get(i.get("applicationService"));
         List<?> ports = app.get("ports") instanceof List<?> list ? list : List.of();
-        if (ports.isEmpty() || !(ports.get(0) instanceof Map<?, ?> p))
-            throw new IllegalArgumentException("未识别应用容器端口");
-        port = Integer.parseInt(String.valueOf(p.get("target")));
+        if (!ports.isEmpty() && ports.get(0) instanceof Map<?, ?> p)
+            port = Integer.parseInt(String.valueOf(p.get("target")));
+        else if (app.get("expose") instanceof List<?> exposed && exposed.size() == 1
+                && String.valueOf(exposed.get(0)).matches("[0-9]{1,5}(/tcp)?"))
+            port = Integer.parseInt(String.valueOf(exposed.get(0)).split("/")[0]);
+        else if (ComposeManager.isVendorEnterprise(i)) port = 8100;
+        else throw new IllegalArgumentException("未识别应用容器端口");
         remote = "/tmp/deops-http-" + UUID.randomUUID();
         local = Files.createTempDirectory("deops-http-");
         OperationsFiles.createPrivateDirectory(local);
@@ -71,19 +75,29 @@ final class ContainerApplicationHttp implements AutoCloseable {
     }
 
     Response request(String path, String token, Path upload, String filename) throws Exception {
-        return request(path, token, upload, filename, null);
+        return request(path, token, upload, filename, null, null);
     }
 
     Response control(String body) throws Exception {
-        return request(ApplicationIsolationGuard.ENDPOINT, "", null, null, body);
+        return request(ApplicationIsolationGuard.ENDPOINT, "", null, null, body, null);
     }
 
-    private Response request(String path, String token, Path upload, String filename, String body) throws Exception {
+    Response login(String prefix, String body) throws Exception {
+        return request(prefix + "/login/localLogin", "", null, null, null, body);
+    }
+
+    Response validateLicense(String prefix, String token) throws Exception {
+        return request(prefix + "/license/validate", token, null, null, null, "{}");
+    }
+
+    private Response request(String path, String token, Path upload, String filename, String body, String jsonPost)
+            throws Exception {
         Properties properties = new Properties();
         properties.setProperty("port", String.valueOf(port));
         properties.setProperty("path", path);
         properties.setProperty("token", token);
         if (body != null) properties.setProperty("control", body);
+        if (jsonPost != null) properties.setProperty("jsonPost", jsonPost);
         if (upload != null) {
             host.upload(instance, credentials, upload, remote + "/upload.jar");
             host.run(

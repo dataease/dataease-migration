@@ -661,6 +661,21 @@
   color: #8b96a6;
   margin: 0;
 }
+.wf-check-progress {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  padding: 11px 14px;
+  background: #eff5ff;
+  color: #234a81;
+  border-radius: 6px;
+  font-size: 13px;
+}
+.submission-progress {
+  display: grid;
+  gap: 10px;
+}
 .wf-check-list {
   border: 1px solid #e6ebf2;
   border-radius: 9px;

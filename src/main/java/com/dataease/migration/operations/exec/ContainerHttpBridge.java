@@ -51,6 +51,13 @@ public final class ContainerHttpBridge {
                 request.header("X-DEOPS-Guard", capability)
                         .header("Content-Type", "application/json")
                         .POST(HttpRequest.BodyPublishers.ofString(p.getProperty("control"), StandardCharsets.UTF_8));
+            } else if (p.getProperty("jsonPost") != null) {
+                String body = p.getProperty("jsonPost");
+                if (!path.matches("(?:/[A-Za-z0-9_-]+)*/de2api/login/localLogin")
+                        && !(path.matches("(?:/[A-Za-z0-9_-]+)*/de2api/license/validate")
+                                && "{}".equals(body) && !token.isBlank())) throw new IOException();
+                request.header("Content-Type", "application/json")
+                        .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8));
             } else if (p.getProperty("upload") != null) {
                 String boundary = "deops-" + UUID.randomUUID(),
                         filename = p.getProperty("filename");

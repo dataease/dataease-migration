@@ -105,6 +105,7 @@ public final class ApplicationIsolationGuard
         final Map<String, Object> schedulers = new TreeMap<>();
         volatile Set<String> allowed = Set.of();
         final Set<String> guardPaused = new HashSet<>();
+        final Object enginePoolLock = new Object();
 
         GuardState(ConfigurableApplicationContext context) {
             this.context = context;
@@ -166,6 +167,61 @@ public final class ApplicationIsolationGuard
             }
             throw new NoSuchMethodException(name);
         }
+
+        Map<String, Object> verifyExcelTables(Object requested, Object requestedRoute, boolean repairMissingPool)
+                throws Exception {
+            if (!(requested instanceof List<?> tables) || tables.isEmpty() || tables.size() > 32)
+                throw new IllegalArgumentException("工作表清单无效");
+            ClassLoader loader = context.getClassLoader();
+            Object engine = call(context.getBean(Class.forName("io.dataease.datasource.manage.EngineManage", true, loader)),
+                    "getDeEngine");
+            if (!"mysql".equals(call(engine, "getType"))) throw new IllegalStateException("引擎类型不受支持");
+            String configuration = Objects.toString(call(engine, "getConfiguration"), "");
+            var engineConfig = json.readTree(configuration);
+            if (!(requestedRoute instanceof Map<?, ?> route) || engineConfig == null || !engineConfig.isObject()
+                    || engineConfig.path("useSSH").asBoolean()
+                    || !engineConfig.path("host").asText().equalsIgnoreCase(Objects.toString(route.get("host"), ""))
+                    || !Objects.equals(engineConfig.path("port").asInt(3306), route.get("port"))
+                    || !Objects.equals(engineConfig.path("dataBase").asText(), route.get("database"))
+                    || !Set.of("", "hostname").contains(engineConfig.path("urlType").asText("").toLowerCase(Locale.ROOT)))
+                throw new IllegalStateException("运行中的引擎配置已变化");
+            Class<?> schemaType = Class.forName("io.dataease.extensions.datasource.dto.DatasourceSchemaDTO", true, loader);
+            Object schema = schemaType.getConstructor().newInstance();
+            Object id = call(engine, "getId");
+            call(schema, "setId", id);
+            call(schema, "setType", "mysql");
+            call(schema, "setConfiguration", configuration);
+            String alias = "s_a_" + id;
+            call(schema, "setSchemaAlias", alias);
+            Class<?> requestType = Class.forName("io.dataease.extensions.datasource.dto.DatasourceRequest", true, loader);
+            Object provider = context.getBean("calciteProvider");
+            if (repairMissingPool) {
+                synchronized (enginePoolLock) {
+                    // Use the same pool initialization method as DataEase's engine settings.
+                    Class<?> calcite = Class.forName("org.apache.calcite.jdbc.CalciteConnection", true, loader);
+                    Class<?> schemaPlus = Class.forName("org.apache.calcite.schema.SchemaPlus", true, loader);
+                    var connection = (java.sql.Connection) call(provider, "take");
+                    Object root = calcite.getMethod("getRootSchema").invoke(connection.unwrap(calcite));
+                    if (schemaPlus.getMethod("getSubSchema", String.class).invoke(root, alias) == null)
+                        call(provider, "update", schema);
+                }
+            }
+            List<Boolean> nonempty = new ArrayList<>();
+            for (Object table : tables) {
+                if (!(table instanceof String name) || name.isBlank() || name.length() > 64
+                        || name.chars().anyMatch(Character::isISOControl))
+                    throw new IllegalArgumentException("工作表名称无效");
+                Object query = requestType.getConstructor().newInstance();
+                call(query, "setDsList", Map.of(id, schema));
+                call(query, "setIsCross", false);
+                call(query, "setQuery", "SELECT 1 AS deops_row FROM `" + name.replace("`", "``") + "` LIMIT 1");
+                Object result = call(provider, "fetchResultField", query);
+                if (!(result instanceof Map<?, ?> rows) || !(rows.get("data") instanceof List<?> values))
+                    throw new IllegalStateException("无法读取引擎查询结果");
+                nonempty.add(!values.isEmpty());
+            }
+            return Map.of("nonempty", nonempty);
+        }
         String digest(Object value) throws Exception {
             return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(json.writeValueAsBytes(value)));
         }
@@ -186,8 +242,9 @@ public final class ApplicationIsolationGuard
             try {
                 if (((Class<?>) call(detail, "getJobClass")).getName().equals("io.dataease.job.schedule.ExtractDataJob")) return true;
                 Class<?> license = Class.forName("io.dataease.license.utils.LicenseUtil", false, context.getClassLoader());
-                if (!Boolean.TRUE.equals(license.getMethod("licenseValid").invoke(null))
-                        || Boolean.FALSE.equals(license.getMethod("validate").invoke(null))) return false;
+                // Validation populates the native license state for the calling Quartz/HTTP thread.
+                if (!Boolean.TRUE.equals(license.getMethod("validate").invoke(null))
+                        || !Boolean.TRUE.equals(license.getMethod("licenseValid").invoke(null))) return false;
                 String group = String.valueOf(call(call(detail, "getKey"), "getGroup"));
                 String bean = Set.of("SYNC_TASK", "SYNC_SIMPLE_TASK").contains(group)
                         ? "dataSyncTaskExecutorInteractImpl" : "xpackTaskExecutorInteractImpl";
@@ -235,14 +292,15 @@ public final class ApplicationIsolationGuard
             if (!schedulers.values().containsAll(actual))
                 throw new IllegalStateException("存在未受管调度器");
             List<Map<String, Object>> jobs = new ArrayList<>();
-            boolean paused = true;
+            boolean schedulingSuspended = true;
+            int runningJobs = 0;
             for (var entry : schedulers.entrySet()) {
                 Object scheduler = entry.getValue();
                 if (Boolean.TRUE.equals(call(scheduler, "isShutdown"))
                         || call(call(scheduler, "getListenerManager"), "getTriggerListener", LISTENER) == null)
                     throw new IllegalStateException("调度保护未生效");
-                paused &= Boolean.TRUE.equals(call(scheduler, "isInStandbyMode"))
-                        && ((List<?>) call(scheduler, "getCurrentlyExecutingJobs")).isEmpty();
+                schedulingSuspended &= Boolean.TRUE.equals(call(scheduler, "isInStandbyMode"));
+                runningJobs += ((List<?>) call(scheduler, "getCurrentlyExecutingJobs")).size();
                 for (Object key : keys(scheduler)) {
                     if (jobs.size() >= 1000) throw new IllegalStateException("任务超过1000项，请先在DataEase缩小任务范围");
                     Object detail = call(scheduler, "getJobDetail", key);
@@ -276,7 +334,9 @@ public final class ApplicationIsolationGuard
                 }
             }
             jobs.sort(Comparator.comparing(row -> String.valueOf(row.get("id"))));
-            return Map.of("guardVersion", 2, "epoch", epoch, "schedulersPaused", paused,
+            return Map.of("guardVersion", 2, "epoch", epoch,
+                    "schedulersPaused", schedulingSuspended && runningJobs == 0,
+                    "schedulingSuspended", schedulingSuspended, "runningJobs", runningJobs,
                     "snapshot", digest(List.of(epoch, jobs.stream().map(row -> List.of(row.get("id"), row.get("definition"), row.get("available"), row.get("enabled"))).toList())), "jobs", jobs);
         }
         synchronized Map<String, Object> apply(Map<String, Object> input) throws Exception {
@@ -298,6 +358,7 @@ public final class ApplicationIsolationGuard
             allowed = Set.of();
             try {
                 for (Object scheduler : schedulers.values()) call(scheduler, "standby");
+                if (ids.isEmpty()) return inventory();
                 for (Object scheduler : schedulers.values())
                     if (!((List<?>) call(scheduler, "getCurrentlyExecutingJobs")).isEmpty())
                         throw new IllegalStateException("有任务仍在执行；后续调度已暂停，等待执行结束后重新检查");
@@ -328,7 +389,7 @@ public final class ApplicationIsolationGuard
                     }
                 }
                 allowed = Set.copyOf(grants);
-                if (!ids.isEmpty()) for (Object scheduler : schedulers.values()) call(scheduler, "start");
+                for (Object scheduler : schedulers.values()) call(scheduler, "start");
                 return inventory();
             } catch (Exception failure) {
                 allowed = Set.of();
@@ -361,7 +422,15 @@ public final class ApplicationIsolationGuard
             try {
                 byte[] bytes = request.getInputStream().readNBytes(128 * 1024 + 1);
                 if (bytes.length > 128 * 1024) throw new IllegalArgumentException("任务清单超过限制");
-                respond(response, 200, state.apply(state.json.readValue(bytes, Map.class)));
+                @SuppressWarnings("unchecked")
+                Map<String, Object> command = state.json.readValue(bytes, Map.class);
+                if ("verifyExcel".equals(command.get("operation"))) {
+                    try { respond(response, 200, state.verifyExcelTables(command.get("tables"), command.get("route"),
+                            Boolean.TRUE.equals(command.get("repairMissingPool")))); }
+                    catch (Exception unavailable) { respond(response, 409, Map.of("message", "DataEase 无法查询 Excel 引擎表")); }
+                    return;
+                }
+                respond(response, 200, state.apply(command));
             } catch (Exception failure) {
                 // Reflective exceptions can contain vendor configuration or task payloads.
                 String message = failure instanceof IllegalArgumentException || failure instanceof IllegalStateException

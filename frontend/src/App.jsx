@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Badge, Empty } from "./ui";
 import {
   Button,
@@ -13,6 +13,10 @@ import {
   CheckResults,
   tone,
   backupLocation,
+  Elapsed,
+  SubmissionProgress,
+  taskActivity,
+  taskInProgress,
 } from "./components";
 import {
   PageHeading,
@@ -28,14 +32,27 @@ import {
   UploadDialog,
   ExportBackupDialog,
   TaskDialog,
+  InstanceAdminDialog,
   AutomationDialog,
 } from "./Dialogs";
 import Workflow from "./Workflow";
 import { OnlinePackageDialog, DownloadRows, DownloadDetailDialog } from "./PackageDownloads";
 import MigrationOverview from "./MigrationOverview";
 import { api, post, put, exportJson } from "./api";
+import { useTaskSubmission } from "./useTaskSubmission";
 import { instanceEnvironment } from "./instanceEnvironment";
-import { backupProtection } from "./backupProtection";
+import { backupProtection, canRebuildFromBackup } from "./backupProtection";
+const uninstalled = (item) => item?.status === "未安装";
+const wholeRecoveryPoint = (backup, instance) => canRebuildFromBackup(backup) && backup.arch === instance.arch
+  && (backup.restoreMode !== "original-enterprise"
+    || instance.connection === "ssh" && instance.host !== backup.instanceSnapshot?.host);
+const canRestoreBackup = (backup, instances) => backup.status === "已校验" && (
+  !backup.restoreMode || canRebuildFromBackup(backup) || (backup.restoreMode === "original-enterprise" &&
+    backup.currentInstanceDeployment === true && instances.some((instance) =>
+      instance.id === backup.instanceId && instance.status !== "未安装" &&
+      instance.version === backup.version && instance.arch === backup.arch &&
+      instance.dbType === backup.dbType))
+);
 const menus = [
   ["overview", "运维概览", "overview"],
   ["instances", "实例管理", "server"],
@@ -68,6 +85,8 @@ const operationName = (kind) =>
     plugin: "安装插件",
     service: "服务操作",
     automation: "自动任务恢复",
+    release: "开放业务访问",
+    uninstall: "卸载 DataEase",
   })[kind] || kind;
 export default function App() {
   const [session, setSession] = useState(null),
@@ -91,9 +110,15 @@ export default function App() {
     setToast(message);
     setTimeout(() => setToast(""), 4500);
   };
+  const refreshSequence = useRef(0);
+  const appliedRefresh = useRef(0);
   const refresh = async () => {
+    const sequence = ++refreshSequence.current;
     const next = await api("/state");
-    setState({ ...empty, ...next });
+    if (sequence > appliedRefresh.current) {
+      appliedRefresh.current = sequence;
+      setState({ ...empty, ...next });
+    }
     return next;
   };
   const loadSession = async () => {
@@ -110,6 +135,7 @@ export default function App() {
   useEffect(() => {
     loadSession();
     const expire = () => {
+      appliedRefresh.current = refreshSequence.current;
       setSession({ authenticated: false });
       setState(empty);
       setDialog(null);
@@ -118,7 +144,7 @@ export default function App() {
     window.addEventListener("session-expired", expire);
     return () => window.removeEventListener("session-expired", expire);
   }, []);
-  const activeWork = state.tasks.some((item) => ["执行中", "排队中"].includes(item.status)) ||
+  const activeWork = state.tasks.some(taskInProgress) ||
     state.downloads.some((item) => ["queued", "checking", "downloading", "pausing", "cancelling", "verifying"].includes(item.state));
   useEffect(() => {
     if (!session?.authenticated) return;
@@ -177,6 +203,7 @@ export default function App() {
           "queued",
           "running",
           "pending_acceptance",
+          "checking_acceptance",
           "accepting",
           "aborting",
           "reconciliation_required",
@@ -205,10 +232,18 @@ export default function App() {
       key: Date.now(),
     });
   };
-  const complete = async (task, message) => {
+  const complete = (task, message) => {
     setFlow(null);
-    await refresh();
-    if (task?.id) setDialog({ type: "task", id: task.id });
+    if (task?.id) {
+      setState((current) => ({
+        ...current,
+        tasks: current.tasks.some((item) => item.id === task.id)
+          ? current.tasks : [task, ...current.tasks],
+      }));
+      if (["install", "uninstall", "release", "migrate"].includes(task.kind)) go("tasks");
+      setDialog({ type: "task", id: task.id, task });
+    }
+    refresh().catch((error) => setError(error.message));
     notify(message || "任务已提交，可查看实际执行阶段与日志。");
   };
   const saved = async () => {
@@ -233,7 +268,8 @@ export default function App() {
       .toLowerCase()
       .includes(query.toLowerCase()) &&
     (filter === "全部" ||
-      [item.status, item.health, item.scope].includes(filter));
+      [item.status, item.health, item.scope].includes(filter) ||
+      (filter === "执行中" && taskInProgress(item)));
   const toolbar = (label, options = ["全部"]) => (
     <div className="toolbar inner">
       <div className="search">
@@ -257,6 +293,12 @@ export default function App() {
       <span className="toolbar-spacer" />
     </div>
   );
+  const deploymentByTarget = new Map(state.tasks
+    .filter((task) => task.kind === "install" && (taskInProgress(task) || task.status === "待验收"))
+    .map((task) => [task.targetId, task]));
+  const releaseByTarget = new Map(state.tasks
+    .filter((task) => task.kind === "release" && taskInProgress(task))
+    .map((task) => [task.targetId, task]));
   const instanceRows = (rows, compact = false) => (
     <>
       <TableRegion label="实例列表">
@@ -295,17 +337,32 @@ export default function App() {
                   </button>
                 </td>
                 <td>
-                  {instance.version}
-                  <small>
+                  {instance.version || "—"}
+                  {instance.dbType && <small>
                     {instance.dbType} · {instance.dbName || instance.db}
-                  </small>
+                  </small>}
                 </td>
                 <td>
-                  <Badge tone={tone(instance.status)}>
-                    {instance.status || "未知"}
+                  <Badge tone={tone(instance.archivedByMigrationTo ? "已停止" : instance.status)}>
+                    {instance.archivedByMigrationTo ? "已迁移" : instance.status || "未知"}
                   </Badge>
                   <small>
-                    {active(instance)
+                    {deploymentByTarget.has(instance.id) ? (
+                      <button
+                        className="link"
+                        onClick={() => setDialog({ type: "task", id: deploymentByTarget.get(instance.id).id })}
+                      >
+                        {deploymentByTarget.get(instance.id).status === "待验收" ? "继续验收" : "查看部署进度"}
+                      </button>
+                    ) : releaseByTarget.has(instance.id) ? (
+                      <button className="link" onClick={() => setDialog({ type: "task", id: releaseByTarget.get(instance.id).id })}>
+                        查看开放进度
+                      </button>
+                    ) : page === "instances" && instance.canOpenAccess && !active(instance) ? (
+                      <button className="link" onClick={() => setDialog({ type: "release", item: instance })}>
+                        开放业务访问
+                      </button>
+                    ) : active(instance)
                       ? "操作锁定中"
                       : instance.connection === "local"
                         ? "本机管理"
@@ -336,6 +393,11 @@ export default function App() {
                 </td>
                 <td>
                   <div className="table-actions">
+                    {uninstalled(instance) ? (
+                      <button className="link" disabled={active(instance)} onClick={() => start("install", null, null, instance.id)}>
+                        安装
+                      </button>
+                    ) : <>
                     <button
                       className="link"
                       disabled={active(instance)}
@@ -349,6 +411,7 @@ export default function App() {
                     >
                       检查
                     </button>
+                    </>}
                     <button
                       className="link"
                       onClick={() =>
@@ -377,50 +440,59 @@ export default function App() {
               <th>任务名称</th>
               <th>操作实例</th>
               <th>状态</th>
-              <th>开始时间</th>
-              <th>进度 / 耗时</th>
+              <th>提交时间</th>
+              <th>当前阶段 / 耗时</th>
               <th>操作</th>
             </tr>
           </thead>
           <tbody>
-            {rows.map((task) => (
-              <tr key={task.id}>
-                <td>
-                  <div className="table-title">
-                    <Icon name="tasks" />
-                    {task.title || operationName(task.kind)}
-                  </div>
-                  <small>{task.id}</small>
-                </td>
-                <td>
-                  {task.instanceName ||
-                    task.instanceSnapshot?.name ||
-                    task.targetName}
-                  <small>
-                    {task.targetName && task.targetName !== task.instanceName
-                      ? `目标：${task.targetName}`
-                      : operationName(task.kind)}
-                  </small>
-                </td>
-                <td>
-                  <Badge tone={tone(task.status)}>{task.status}</Badge>
-                </td>
-                <td>{date(task.createdAt || task.startedAt)}</td>
-                <td>
-                  {task.status === "执行中"
-                    ? `${task.progress || 0}%`
-                    : task.duration || "—"}
-                </td>
-                <td>
-                  <button
-                    className="link"
-                    onClick={() => setDialog({ type: "task", id: task.id })}
-                  >
-                    查看详情
-                  </button>
-                </td>
-              </tr>
-            ))}
+            {rows.map((task) => {
+              const activity = taskInProgress(task) ? taskActivity(task) : null;
+              return (
+                <tr key={task.id}>
+                  <td>
+                    <div className="table-title">
+                      <Icon name="tasks" />
+                      {task.title || operationName(task.kind)}
+                    </div>
+                    <small>{task.id}</small>
+                  </td>
+                  <td>
+                    {task.instanceName ||
+                      task.instanceSnapshot?.name ||
+                      task.targetName}
+                    <small>
+                      {task.targetName && task.targetName !== task.instanceName
+                        ? `目标：${task.targetName}`
+                        : operationName(task.kind)}
+                    </small>
+                  </td>
+                  <td>
+                    <Badge tone={tone(task.status)}>
+                      {taskInProgress(task) && <span className="task-spinner" aria-hidden="true" />}
+                      {task.status}
+                    </Badge>
+                  </td>
+                  <td>{date(task.createdAt || task.startedAt)}</td>
+                  <td className="task-progress-cell">
+                    {activity ? (
+                      <>
+                        <div>{activity.title}</div>
+                        <Elapsed since={activity.since} label={activity.waiting ? "已等待" : "已用"} />
+                      </>
+                    ) : task.duration || "—"}
+                  </td>
+                  <td>
+                    <button
+                      className="link"
+                      onClick={() => setDialog({ type: "task", id: task.id })}
+                    >
+                      {taskInProgress(task) ? task.kind === "install" ? "查看部署进度" : "查看进度" : "查看详情"}
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
         {!rows.length && <Empty text="暂无任务记录" />}
@@ -448,7 +520,13 @@ export default function App() {
       </>
     );
   const current = menus.find((item) => item[0] === page) || menus[0];
-  const instances = state.instances.filter(matches);
+  const currentInstances = state.instances.filter((item) => !item.archivedByMigrationTo);
+  const deployedInstances = currentInstances.filter((item) => !uninstalled(item));
+  const instances = page === "instances"
+    ? state.instances.filter((item) => filter === "已迁移"
+        ? item.archivedByMigrationTo && matches({ ...item, status: "已迁移" })
+        : !item.archivedByMigrationTo && matches(item))
+    : deployedInstances.filter(matches);
   const tasks = state.tasks.filter(matches);
   const backups = state.backups.filter(matches);
   const media = (
@@ -460,7 +538,7 @@ export default function App() {
       : null;
   const selectedTask =
     dialog?.type === "task"
-      ? state.tasks.find((item) => item.id === dialog.id)
+      ? state.tasks.find((item) => item.id === dialog.id) || dialog.task
       : null;
   const selectedBackup =
     dialog?.type === "backup"
@@ -564,7 +642,7 @@ export default function App() {
           </div>
           <div className="context-tools">
             <span className="muted">
-              全局管理 · {state.instances.length} 个实例
+              全局管理 · {currentInstances.length} 个实例
             </span>
             <button
               className="icon-button"
@@ -599,18 +677,18 @@ export default function App() {
                 {[
                   [
                     "纳管实例",
-                    state.instances.length,
-                    `${state.instances.filter((item) => item.status === "运行中").length} 个运行`,
+                    currentInstances.length,
+                    `${currentInstances.filter((item) => item.status === "运行中").length} 个运行`,
                   ],
                   [
                     "需要关注",
-                    state.instances.filter((item) => item.health !== "正常")
+                    deployedInstances.filter((item) => item.health !== "正常")
                       .length,
                     "异常或尚未检查",
                   ],
                   [
                     "整体备份覆盖",
-                    state.instances.filter(
+                    deployedInstances.filter(
                       (item) => backupProtection(item, state.backups).protected,
                     ).length,
                     "当前版本 · 已校验的一致整体备份",
@@ -635,14 +713,14 @@ export default function App() {
               <div className="global-attention">
                 <Icon name="info" />
                 <span>
-                  {state.instances.length
-                    ? state.instances.some(
+                  {deployedInstances.length
+                    ? deployedInstances.some(
                         (item) =>
                           !backupProtection(item, state.backups).protected,
                       )
-                      ? `${state.instances.filter((item) => !backupProtection(item, state.backups).protected).length} 个实例缺少当前版本的一致整体备份，分项或在线备份不计入完整保护。`
+                      ? `${deployedInstances.filter((item) => !backupProtection(item, state.backups).protected).length} 个实例缺少当前版本的一致整体备份，分项或在线备份不计入完整保护。`
                       : "所有实例均有当前版本的已校验一致整体备份，请定期核对恢复点并进行恢复演练。"
-                    : "暂无已接入实例，请在实例管理中接入现有环境。"}
+                    : "暂无已部署的 DataEase 实例。"}
                 </span>
                 <button className="link" onClick={() => go("instances")}>
                   实例管理
@@ -656,7 +734,7 @@ export default function App() {
                       全部实例
                     </button>
                   </div>
-                  {instanceRows(state.instances.slice(0, 5), true)}
+                  {instanceRows(currentInstances.slice(0, 5), true)}
                 </section>
                 <section className="quick-actions">
                   {[
@@ -701,31 +779,31 @@ export default function App() {
                     >
                       接入已有实例
                     </Button>
-                    <Button primary icon="add" onClick={() => start("install")}>
-                      安装新实例
+                    <Button primary icon="add" onClick={() => setDialog({ type: "register-host" })}>
+                      添加新实例
                     </Button>
                   </>
                 }
               />
               <ModuleSummary
                 items={[
-                  { label: "全部实例", value: state.instances.length },
+                  { label: "当前实例", value: currentInstances.length },
                   {
                     label: "运行中",
-                    value: state.instances.filter(
+                    value: currentInstances.filter(
                       (item) => item.status === "运行中",
                     ).length,
                     tone: "green",
                   },
                   {
-                    label: "已停止",
-                    value: state.instances.filter(
-                      (item) => item.status === "已停止",
+                    label: "未安装",
+                    value: currentInstances.filter(
+                      uninstalled,
                     ).length,
                   },
                   {
                     label: "待验收",
-                    value: state.instances.filter(
+                    value: currentInstances.filter(
                       (item) => item.status === "待验收",
                     ).length,
                     tone: "amber",
@@ -733,14 +811,16 @@ export default function App() {
                 ]}
               />
               <section className="panel">
-                <ListHeading title="实例列表" count={state.instances.length} />
+                <ListHeading title="实例列表" count={instances.length} />
                 {toolbar("搜索名称、IP 或版本", [
                   "全部",
                   "运行中",
                   "已停止",
+                  "未安装",
                   "待验收",
                   "隔离运行",
                   "未知",
+                  "已迁移",
                 ])}
                 {instanceRows(instances)}
               </section>
@@ -842,7 +922,7 @@ export default function App() {
                               </td>
                               <td>
                                 {backup.scope}
-                                <small>{backup.version}</small>
+                                <small>{backup.version}{backup.restoreMode === "manual" ? " · 可导出归档" : backup.restoreMode === "original-enterprise" ? canRebuildFromBackup(backup) ? " · 可异机重建" : " · 仅限原部署还原" : ""}</small>
                               </td>
                               <td>
                                 <Badge tone={tone(backup.status)}>
@@ -872,15 +952,14 @@ export default function App() {
                                   >
                                     详情
                                   </button>
-                                  <button
+                                  {canRestoreBackup(backup, state.instances) && <button
                                     className="link"
-                                    disabled={backup.status !== "已校验"}
                                     onClick={() =>
                                       start("restore", null, backup)
                                     }
                                   >
                                     还原
-                                  </button>
+                                  </button>}
                                 </div>
                               </td>
                             </tr>
@@ -1010,7 +1089,7 @@ export default function App() {
                       onClick={() =>
                         exportJson(
                           "DataEase-健康报告.json",
-                          state.instances.map((item) => ({
+                          deployedInstances.map((item) => ({
                             name: item.name,
                             host: item.host,
                             health: item.health,
@@ -1043,17 +1122,17 @@ export default function App() {
               />
               <ModuleSummary
                 items={[
-                  { label: "全部实例", value: state.instances.length },
+                  { label: "全部实例", value: deployedInstances.length },
                   {
                     label: "检查正常",
-                    value: state.instances.filter(
+                    value: deployedInstances.filter(
                       (item) => item.health === "正常",
                     ).length,
                     tone: "green",
                   },
                   {
                     label: "建议关注",
-                    value: state.instances.filter(
+                    value: deployedInstances.filter(
                       (item) =>
                         item.health === "关注" || item.health === "异常",
                     ).length,
@@ -1065,7 +1144,7 @@ export default function App() {
               <section className="panel">
                 <ListHeading
                   title="实例检查记录"
-                  count={state.instances.length}
+                  count={deployedInstances.length}
                 />
                 {toolbar("搜索检查实例", [
                   "全部",
@@ -1299,27 +1378,13 @@ export default function App() {
           )}
           {page === "tasks" && (
             <>
-              <PageHeading
-                title="任务中心"
-                actions={
-                  <Button
-                    icon="download"
-                    onClick={() =>
-                      exportJson("DataEase-任务记录.json", state.tasks)
-                    }
-                  >
-                    导出任务记录
-                  </Button>
-                }
-              />
+              <PageHeading title="任务中心" />
               <ModuleSummary
                 items={[
                   { label: "全部任务", value: state.tasks.length },
                   {
                     label: "执行中",
-                    value: state.tasks.filter((item) =>
-                      ["执行中", "排队中"].includes(item.status),
-                    ).length,
+                    value: state.tasks.filter(taskInProgress).length,
                     tone: "green",
                   },
                   {
@@ -1391,15 +1456,20 @@ export default function App() {
           }}
         />
       )}
-      {["connect", "connection"].includes(dialog?.type) && (
+      {["connect", "connection", "register-host"].includes(dialog?.type) && (
         <ConnectDialog
+          registerHost={dialog.type === "register-host"}
           instance={
             dialog.type === "connection"
               ? state.instances.find((item) => item.id === dialog.id)
               : null
           }
           onClose={() => setDialog(null)}
-          onSaved={saved}
+          onSaved={dialog.type === "register-host" ? async (item) => {
+            await refresh();
+            setDialog({ type: "instance", id: item.id });
+            notify("实例已添加");
+          } : saved}
         />
       )}
       {dialog?.type === "online-package" && <OnlinePackageDialog defaultKind={dialog.kind} onClose={() => setDialog(null)} onCreated={async (task) => { await refresh(); setMediaTab("downloads"); setQuery(""); setFilter("全部"); setDialog({ type: "download-detail", id: task.id }); }} />}
@@ -1418,13 +1488,13 @@ export default function App() {
           state={state}
           onClose={() => setDialog(null)}
           onRefresh={refresh}
-          onRestore={(backup, targetId, protectionTaskId) =>
+          onRestore={(backup, targetId, protectionTaskId, packageId) =>
             start(
               "restore",
               null,
               backup,
               targetId,
-              undefined,
+              packageId,
               protectionTaskId,
             )
           }
@@ -1434,6 +1504,16 @@ export default function App() {
           }}
           onAbort={(task) => setDialog({ type: "abort", item: task })}
           onReconcile={(task) => setDialog({ type: "reconcile", item: task })}
+          onInitialAdmin={(item) => setDialog({ type: "initial-admin", item })}
+        />
+      )}
+      {["initial-admin", "uninstall"].includes(dialog?.type) && (
+        <InstanceAdminDialog
+          key={`${dialog.type}-${dialog.item.id}`}
+          instance={dialog.item}
+          uninstall={dialog.type === "uninstall"}
+          onClose={() => setDialog({ type: "instance", id: dialog.item.id })}
+          onQueued={complete}
         />
       )}
       {dialog?.type === "automation" && (
@@ -1455,7 +1535,33 @@ export default function App() {
             >
               连接设置
             </Button>
+            {(selectedInstance.hasInitialAdmin || selectedInstance.hasMigratedInitialAdmin) && (
+              <Button small onClick={() => setDialog({ type: "initial-admin", item: selectedInstance })}>
+                {selectedInstance.hasMigratedInitialAdmin ? "查看迁入的初始密码" : "查看初始密码"}
+              </Button>
+            )}
           </div>
+          {selectedInstance.archivedByMigrationTo && (
+            <Notice>同机迁移已验收，原 V2 已停止，原数据保留。</Notice>
+          )}
+          {uninstalled(selectedInstance) ? (
+            <>
+              <Facts rows={[
+                ["环境标识", instanceEnvironment(selectedInstance)],
+                ["服务器", selectedInstance.host],
+                ["架构", selectedInstance.arch],
+              ]} />
+              <div className="instance-operation-grid">
+                <Button primary disabled={active(selectedInstance)} onClick={() => start("install", null, null, selectedInstance.id)}>
+                  安装 DataEase
+                </Button>
+                <Button disabled={active(selectedInstance)} onClick={() =>
+                  setDialog({ type: "host-restore", id: selectedInstance.id, backupId: "" })}>
+                  从备份还原
+                </Button>
+              </div>
+            </>
+          ) : <>
           <h3>环境组成</h3>
           <Facts
             rows={[
@@ -1498,6 +1604,16 @@ export default function App() {
           </Button>
           <h3 className="section-title">实例操作</h3>
           <div className="instance-operation-grid">
+            {selectedInstance.archivedByMigrationTo && (
+              <Button onClick={() => setDialog({ type: "instance", id: selectedInstance.archivedByMigrationTo })}>
+                查看迁入的 V3
+              </Button>
+            )}
+            {selectedInstance.canOpenAccess && (
+              <Button disabled={active(selectedInstance)} onClick={() => setDialog({ type: "release", item: selectedInstance })}>
+                开放业务访问
+              </Button>
+            )}
             <Button disabled={active(selectedInstance)} onClick={() => setDialog({ type: "automation", item: selectedInstance })}>
               管理自动任务
             </Button>
@@ -1505,7 +1621,7 @@ export default function App() {
               ["backup", "创建备份"],
               ["check", "健康检查"],
               ["upgrade", "离线升级"],
-              ...(/^v?2\./.test(selectedInstance.version)
+              ...(/^v?2\./.test(selectedInstance.version) && !selectedInstance.archivedByMigrationTo
                 ? [["migrate", "迁移到 V3"]]
                 : []),
             ].map(([kind, label]) => (
@@ -1530,9 +1646,46 @@ export default function App() {
             >
               {selectedInstance.status === "已停止" ? "启动实例" : "停止实例"}
             </Button>
+            {selectedInstance.deploymentAdapter === "dataease-enterprise-vendor-compose-v1" && (
+              <Button
+                disabled={state.tasks.some((item) => item.kind === "uninstall" && item.targetId === selectedInstance.id
+                  && ["queued", "running", "reconciliation_required", "reconciling"].includes(item.state))
+                  || (active(selectedInstance) && deploymentByTarget.get(selectedInstance.id)?.status !== "待验收")}
+                onClick={() => setDialog({ type: "uninstall", item: selectedInstance })}
+              >
+                卸载 DataEase
+              </Button>
+            )}
           </div>
+          </>}
         </Modal>
       )}
+      {dialog?.type === "host-restore" && (() => {
+        const host = state.instances.find((item) => item.id === dialog.id && uninstalled(item));
+        if (!host) return null;
+        const eligible = state.backups.filter((backup) => wholeRecoveryPoint(backup, host));
+        const backup = eligible.find((item) => item.id === dialog.backupId);
+        return (
+          <Modal title={`从备份还原 · ${host.name}`}
+            onClose={() => setDialog({ type: "instance", id: host.id })}
+            actions={<>
+              <Button onClick={() => setDialog({ type: "instance", id: host.id })}>返回</Button>
+              <Button primary disabled={!backup || active(host)} onClick={() => start("restore", null, backup, host.id)}>下一步</Button>
+            </>}>
+            {eligible.length ? (
+              <Field label="整体备份">
+                <Select aria-label="整体备份" value={dialog.backupId}
+                  onChange={(event) => setDialog({ ...dialog, backupId: event.target.value })}>
+                  <option value="">请选择已校验整体备份</option>
+                  {eligible.map((item) => <option key={item.id} value={item.id}>
+                    {item.name} · {item.version} · {date(item.recoveryPoint || item.createdAt)}
+                  </option>)}
+                </Select>
+              </Field>
+            ) : <Notice>暂无与此服务器匹配的整体备份。企业版异机重建需要暂停写入的整体备份和另一台 SSH 服务器。</Notice>}
+          </Modal>
+        );
+      })()}
       {selectedBackup && (
         <Modal
           title={selectedBackup.name}
@@ -1552,13 +1705,12 @@ export default function App() {
               >
                 重新校验
               </Button>
-              <Button
+              {canRestoreBackup(selectedBackup, state.instances) && <Button
                 primary
-                disabled={selectedBackup.status !== "已校验"}
                 onClick={() => start("restore", null, selectedBackup)}
               >
                 还原备份
-              </Button>
+              </Button>}
             </>
           }
         >
@@ -1585,9 +1737,15 @@ export default function App() {
                     ? "同机保存，不能抵御原服务器故障"
                     : "尚未确认是否与来源实例位于不同物理服务器",
               ],
-              ["恢复演练", selectedBackup.drillStatus || "未演练"],
+              ["恢复演练", selectedBackup.lastDrillAt ? `已通过 · ${date(selectedBackup.lastDrillAt)}` : "未演练"],
             ]}
           />
+          {selectedBackup.restoreMode === "manual" && (
+            <Notice>此备份可校验和导出。要恢复原厂企业版部署，请暂停应用写入后创建新的整体备份。</Notice>
+          )}
+          {selectedBackup.restoreMode === "original-enterprise" && !canRestoreBackup(selectedBackup, state.instances) && (
+            <Notice>仅可还原到创建此备份的原部署。当前列表中没有匹配的恢复目标。</Notice>
+          )}
           <h3>备份覆盖清单</h3>
           <CheckResults
             checks={(selectedBackup.coverage || []).map((item) => ({
@@ -1736,12 +1894,8 @@ export default function App() {
         <ConfirmDialog
           title={dialog.action === "start" ? "启动实例" : "停止实例"}
           onClose={() => setDialog(null)}
-          action={async () => {
-            const result = await post(`/instances/${dialog.item.id}/service`, {
-              action: dialog.action,
-            });
-            await complete(result);
-          }}
+          command={{ kind: "service", sourceId: dialog.item.id, action: dialog.action }}
+          action={complete}
         >
           <Facts
             rows={[
@@ -1754,6 +1908,30 @@ export default function App() {
             {dialog.action === "stop"
               ? "停止 DataEase 应用，MySQL 保持运行。"
               : "平台按已保存的访问策略启动；隔离实例继续保持隔离。"}
+          </Notice>
+        </ConfirmDialog>
+      )}
+      {dialog?.type === "release" && (
+        <ConfirmDialog
+          title="开放业务访问"
+          confirmName={dialog.item.name}
+          confirmLabel="确认开放"
+          onClose={() => setDialog({ type: "instance", id: dialog.item.id })}
+          action={async (confirmation) => {
+            const task = await post(`/instances/${dialog.item.id}/open-access`, {
+              confirmTargetName: confirmation,
+              instanceRevision: dialog.item.revision,
+            });
+            complete(task);
+          }}
+        >
+          <Facts rows={[
+            ["实例", dialog.item.name],
+            ["服务器", dialog.item.host],
+            ["业务端口", dialog.item.port],
+          ]} />
+          <Notice tone="amber">
+            平台会先复核运行条件，通过后按部署配置开放业务入口。切换期间会重建相关容器，自动任务保持暂停。
           </Notice>
         </ConfirmDialog>
       )}
@@ -1773,7 +1951,7 @@ export default function App() {
           }}
         >
           <Notice tone="amber">
-            平台无法仅凭连接断开确认执行已终止。请先在服务器核查，再提交确认；平台会重新探测两端应用，确认停止后才解除互斥。目标数据不会自动回滚。
+            请先在服务器核对本次任务，再提交确认。平台核验相关应用均已停止后解除实例锁。
           </Notice>
         </ConfirmDialog>
       )}
@@ -1831,18 +2009,22 @@ function ConfirmDialog({
   children,
   onClose,
   action,
+  command,
   confirmName,
   confirmCheckLabel,
+  confirmLabel = "确认",
 }) {
   const [busy, setBusy] = useState(false),
     [error, setError] = useState(""),
     [confirmation, setConfirmation] = useState(""),
     [checked, setChecked] = useState(false);
+  const { progress, submit } = useTaskSubmission();
   return (
     <Modal
       title={title}
       onClose={onClose}
       busy={busy}
+      busyLabel={command && progress ? null : undefined}
       wide={false}
       actions={
         <>
@@ -1858,8 +2040,12 @@ function ConfirmDialog({
             }
             onClick={async () => {
               setBusy(true);
+              setError("");
               try {
-                await action();
+                if (command) {
+                  const result = await submit(command);
+                  if (result?.task) await action(result.task);
+                } else await action(confirmation);
               } catch (error) {
                 setError(error.message);
               } finally {
@@ -1867,7 +2053,7 @@ function ConfirmDialog({
               }
             }}
           >
-            {busy ? "正在处理…" : "确认"}
+            {busy ? "正在处理…" : confirmLabel}
           </Button>
         </>
       }
@@ -1885,6 +2071,7 @@ function ConfirmDialog({
           {confirmCheckLabel}
         </Check>
       )}
+      {progress && <SubmissionProgress progress={progress} />}
       {error && <Notice tone="red">{error}</Notice>}
     </Modal>
   );
@@ -1962,16 +2149,6 @@ function EnvironmentDialog({ instance, onClose, onSaved }) {
           />
         </>
       )}
-      <Field label="业务验收样例查询（只读 SQL）">
-        <textarea
-          rows="4"
-          value={value.acceptanceQuery || ""}
-          onChange={(event) =>
-            setValue({ ...value, acceptanceQuery: event.target.value })
-          }
-          placeholder="填写代表性 SELECT，自动验收会实际执行；不代替仪表板业务核对。"
-        />
-      </Field>
       <Notice>
         外部引擎未纳入一致性保护时，自动整体备份、迁移和环境重建会阻断。
       </Notice>
@@ -2040,14 +2217,31 @@ function MediaDetail({ item, onClose, onSaved }) {
     [error, setError] = useState(""),
     [busy, setBusy] = useState(false),
     [minimum, setMinimum] = useState(item.minimumUpgradeSource || "");
+  const editableUpgrade = item.adapter === "dataease-compose-v1" && item.status === "已校验";
   return (
     <Modal
       title="软件包详情"
       onClose={onClose}
+      busy={busy}
+      busyLabel="正在校验软件包"
       actions={
         <>
-          <Button onClick={onClose}>关闭</Button>
-          {item.adapter === "dataease-compose-v1" && (
+          <Button disabled={busy} onClick={onClose}>关闭</Button>
+          {item.status === "待校验" && (
+            <Button disabled={busy} onClick={async () => {
+              setBusy(true);
+              setError("");
+              try {
+                await post(`/packages/${item.id}/verify`);
+                await onSaved();
+              } catch (error) {
+                setError(error.message);
+              } finally {
+                setBusy(false);
+              }
+            }}>校验软件包</Button>
+          )}
+          {editableUpgrade && (
             <Button
               primary
               disabled={
@@ -2056,9 +2250,10 @@ function MediaDetail({ item, onClose, onSaved }) {
               onClick={async () => {
                 setBusy(true);
                 try {
-                  await put(`/packages/${item.id}/manifest`, {
-                    ...item.manifest,
+                  await put(`/packages/${item.id}/upgrade-compatibility`, {
                     minimumUpgradeSource: minimum,
+                    sha256: item.sha256,
+                    revision: item.revision ?? 0,
                   });
                   await onSaved();
                 } catch (error) {
@@ -2112,7 +2307,7 @@ function MediaDetail({ item, onClose, onSaved }) {
           {item.validationMessage}
         </Notice>
       )}
-      {item.adapter === "dataease-compose-v1" && (
+      {editableUpgrade && (
         <>
           <Field
             label="最低可升级来源版本"
