@@ -25,5 +25,3 @@ migration:
   ssh:
     connect-timeout-millis: 30000
     command-timeout-millis: 3600000
-  mysql-tools:
-    directory: ${MIGRATION_MYSQL_TOOLS_DIRECTORY:tools/mysql}

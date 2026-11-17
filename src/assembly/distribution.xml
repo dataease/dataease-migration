@@ -17,10 +17,6 @@
             <outputDirectory>/</outputDirectory>
         </fileSet>
         <fileSet>
-            <directory>${project.basedir}/tools</directory>
-            <outputDirectory>tools</outputDirectory>
-        </fileSet>
-        <fileSet>
             <directory>${project.basedir}/plugins</directory>
             <outputDirectory>plugins</outputDirectory>
             <includes>

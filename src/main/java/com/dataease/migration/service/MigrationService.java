@@ -68,7 +68,7 @@ public class MigrationService {
 
     private final SshCommandExecutor ssh;
     private final DataEaseVersionValidator dataEaseVersionValidator;
-    private final DatabaseMigrationSelector databaseMigrator;
+    private final JdbcDatabaseMigrator databaseMigrator;
     private final TargetDatabaseUpgradeService targetDatabaseUpgradeService;
     private final PluginMigrationService pluginMigrationService;
     private final SyncManagementMigrationService syncManagementMigrationService;
@@ -77,7 +77,7 @@ public class MigrationService {
     private final Map<String, MigrationJob> jobs = new ConcurrentHashMap<>();
 
     public MigrationService(SshCommandExecutor ssh, DataEaseVersionValidator dataEaseVersionValidator,
-                            DatabaseMigrationSelector databaseMigrator,
+                            JdbcDatabaseMigrator databaseMigrator,
                             TargetDatabaseUpgradeService targetDatabaseUpgradeService,
                             PluginMigrationService pluginMigrationService,
                             SyncManagementMigrationService syncManagementMigrationService,
