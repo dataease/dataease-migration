@@ -16,13 +16,15 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Properties;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
- * 没有可用 mysql/mysqldump 时使用的 JDBC 回退迁移器，负责复制 MySQL 结构和数据。
+ * 通过 JDBC 复制 MySQL 结构和数据。
  * 大表数据采用流式读取、批量改写和分段提交，避免一次性加载全表或逐行网络往返。
  */
 @Component
-public class JdbcDatabaseMigrator implements DatabaseMigrator {
+public class JdbcDatabaseMigrator {
     /**
      * 单批行数需要同时兼顾吞吐和内存：Connector/J 会将一批改写成多值 INSERT，而同步日志表
      * 可能含有较大的 TEXT/LONGTEXT，批次过大会显著抬高迁移进程及 MySQL 的瞬时内存占用。
@@ -32,8 +34,12 @@ public class JdbcDatabaseMigrator implements DatabaseMigrator {
      * 每 20 批提交一次，减少逐批提交的 fsync 开销；用 BATCH_SIZE 计算可保证提交前没有待执行批次。
      */
     private static final int COMMIT_INTERVAL = BATCH_SIZE * 20;
+    private static final String BACKTICK_IDENTIFIER = "`(?:``|[^`])*`";
+    private static final Pattern SQL_TOKENS = sqlTokens(false, false);
+    private static final Pattern SQL_TOKENS_ANSI = sqlTokens(true, false);
+    private static final Pattern SQL_TOKENS_NO_ESCAPES = sqlTokens(false, true);
+    private static final Pattern SQL_TOKENS_ANSI_NO_ESCAPES = sqlTokens(true, true);
 
-    @Override
     public void migrate(DatabaseInfo source, DatabaseInfo target, MigrationJob job) throws SQLException {
         DatabaseConnection sourceConnection = DatabaseConnection.fromJdbcUrl(source.jdbcUrl());
         DatabaseConnection targetConnection = DatabaseConnection.fromJdbcUrl(target.jdbcUrl());
@@ -48,9 +54,7 @@ public class JdbcDatabaseMigrator implements DatabaseMigrator {
                 List<String> tables = findObjects(sourceDb, sourceConnection.database(), "BASE TABLE");
                 job.log("正在迁移 " + tables.size() + " 个数据表结构。");
                 for (String table : tables) {
-                    execute(targetDb, rewriteDatabaseReference(
-                            showCreate(sourceDb, "TABLE", sourceConnection.database(), table),
-                            sourceConnection.database(), targetConnection.database()));
+                    createObject(sourceDb, targetDb, "TABLE", sourceConnection.database(), targetConnection.database(), table);
                 }
 
                 for (String table : tables) {
@@ -216,8 +220,7 @@ public class JdbcDatabaseMigrator implements DatabaseMigrator {
                               MigrationJob job) throws SQLException {
         for (String view : findObjects(source, sourceDatabase, "VIEW")) {
             job.log("正在迁移视图：" + view + "。");
-            execute(target, rewriteDatabaseReference(showCreate(source, "VIEW", sourceDatabase, view),
-                    sourceDatabase, targetDatabase));
+            createObject(source, target, "VIEW", sourceDatabase, targetDatabase, view);
         }
     }
 
@@ -231,8 +234,7 @@ public class JdbcDatabaseMigrator implements DatabaseMigrator {
                     String name = result.getString(1);
                     String type = result.getString(2);
                     job.log("正在迁移" + ("PROCEDURE".equals(type) ? "存储过程" : "函数") + "：" + name + "。");
-                    execute(target, rewriteDatabaseReference(showCreate(source, type, sourceDatabase, name),
-                            sourceDatabase, targetDatabase));
+                    createObject(source, target, type, sourceDatabase, targetDatabase, name);
                 }
             }
         }
@@ -246,8 +248,7 @@ public class JdbcDatabaseMigrator implements DatabaseMigrator {
             while (result.next()) {
                 String name = result.getString("Trigger");
                 job.log("正在迁移触发器：" + name + "。");
-                execute(target, rewriteDatabaseReference(showCreate(source, "TRIGGER", sourceDatabase, name),
-                        sourceDatabase, targetDatabase));
+                createObject(source, target, "TRIGGER", sourceDatabase, targetDatabase, name);
             }
         }
     }
@@ -260,31 +261,53 @@ public class JdbcDatabaseMigrator implements DatabaseMigrator {
             while (result.next()) {
                 String name = result.getString("Name");
                 job.log("正在迁移事件：" + name + "。");
-                execute(target, rewriteDatabaseReference(showCreate(source, "EVENT", sourceDatabase, name),
-                        sourceDatabase, targetDatabase));
+                createObject(source, target, "EVENT", sourceDatabase, targetDatabase, name);
             }
         }
     }
 
-    private String showCreate(Connection connection, String type, String database, String object) throws SQLException {
+    private void createObject(Connection source, Connection target, String type, String sourceDatabase,
+                              String targetDatabase, String object) throws SQLException {
+        CreateDefinition definition = showCreate(source, type, sourceDatabase, object);
+        String sql = rewriteDatabaseReference(definition, sourceDatabase, targetDatabase);
+        if (definition.sqlMode() == null) {
+            execute(target, sql);
+            return;
+        }
+        // Stored objects retain the SQL mode active when their body is created.
+        execute(target, "SET @de_migration_previous_sql_mode = @@SESSION.sql_mode");
+        try (PreparedStatement mode = target.prepareStatement("SET SESSION sql_mode = ?")) {
+            mode.setString(1, definition.sqlMode());
+            mode.execute();
+            execute(target, sql);
+        } finally {
+            execute(target, "SET SESSION sql_mode = @de_migration_previous_sql_mode");
+        }
+    }
+
+    private CreateDefinition showCreate(Connection connection, String type, String database, String object)
+            throws SQLException {
         String statement = "SHOW CREATE " + type + " " + qualifiedName(database, object);
         try (Statement query = connection.createStatement(); ResultSet result = query.executeQuery(statement)) {
             if (!result.next()) {
                 throw new SQLException("无法读取 " + type + " 定义：" + object);
             }
-            return createDefinition(result);
-        }
-    }
-
-    private String createDefinition(ResultSet result) throws SQLException {
-        ResultSetMetaData metadata = result.getMetaData();
-        for (int column = 1; column <= metadata.getColumnCount(); column++) {
-            String label = metadata.getColumnLabel(column);
-            if (label.startsWith("Create ") || label.contains("Statement")) {
-                return result.getString(column);
+            ResultSetMetaData metadata = result.getMetaData();
+            String sql = null;
+            String sqlMode = null;
+            for (int column = 1; column <= metadata.getColumnCount(); column++) {
+                String label = metadata.getColumnLabel(column);
+                if (label.startsWith("Create ") || label.contains("Statement")) {
+                    sql = result.getString(column);
+                } else if ("sql_mode".equalsIgnoreCase(label)) {
+                    sqlMode = result.getString(column);
+                }
             }
+            if (sql == null) {
+                throw new SQLException("数据库未返回对象创建语句：" + object);
+            }
+            return new CreateDefinition(sql, sqlMode);
         }
-        throw new SQLException("数据库未返回对象创建语句");
     }
 
     private void execute(Connection connection, String sql) throws SQLException {
@@ -297,8 +320,46 @@ public class JdbcDatabaseMigrator implements DatabaseMigrator {
         return ShellEscaper.sqlIdentifier(database) + "." + ShellEscaper.sqlIdentifier(object);
     }
 
-    private String rewriteDatabaseReference(String definition, String sourceDatabase, String targetDatabase) {
-        return definition.replace(ShellEscaper.sqlIdentifier(sourceDatabase) + ".",
-                ShellEscaper.sqlIdentifier(targetDatabase) + ".");
+    private String rewriteDatabaseReference(CreateDefinition definition, String sourceDatabase, String targetDatabase) {
+        if (sourceDatabase.equals(targetDatabase)) {
+            return definition.sql();
+        }
+        List<String> modes = definition.sqlMode() == null ? List.of() : List.of(definition.sqlMode().split(","));
+        boolean ansiQuotes = modes.contains("ANSI_QUOTES");
+        boolean noEscapes = modes.contains("NO_BACKSLASH_ESCAPES");
+        Pattern tokens = ansiQuotes ? (noEscapes ? SQL_TOKENS_ANSI_NO_ESCAPES : SQL_TOKENS_ANSI)
+                : (noEscapes ? SQL_TOKENS_NO_ESCAPES : SQL_TOKENS);
+        String backtickName = ShellEscaper.sqlIdentifier(sourceDatabase);
+        String doubleQuotedName = '"' + sourceDatabase.replace("\"", "\"\"") + '"';
+        String replacement = Matcher.quoteReplacement(ShellEscaper.sqlIdentifier(targetDatabase));
+        Matcher matcher = tokens.matcher(definition.sql());
+        StringBuilder rewritten = new StringBuilder();
+        while (matcher.find()) {
+            String name = matcher.group("qualifier");
+            if (sourceDatabase.equals(name) || backtickName.equals(name) || (ansiQuotes && doubleQuotedName.equals(name))) {
+                matcher.appendReplacement(rewritten, replacement);
+            }
+        }
+        return matcher.appendTail(rewritten).toString();
     }
+
+    private static Pattern sqlTokens(boolean ansiQuotes, boolean noEscapes) {
+        String singleQuotedString = quotedToken('\'', !noEscapes);
+        String doubleQuotedToken = quotedToken('"', !ansiQuotes && !noEscapes);
+        String quotedNames = ansiQuotes ? BACKTICK_IDENTIFIER + "|" + doubleQuotedToken : BACKTICK_IDENTIFIER;
+        String bareName = "[\\p{Alnum}_$\\x{0080}-\\x{FFFF}]++";
+        String comments = "/\\*.*?\\*/|(?:#|--(?=\\s)).*?(?=\\R|\\z)";
+        // Match literals and comments as a whole before considering identifiers.
+        return Pattern.compile("(?s)" + comments + "|" + singleQuotedString
+                + (ansiQuotes ? "" : "|" + doubleQuotedToken)
+                + "|(?<qualifier>" + quotedNames + "|" + bareName + ")(?=\\s*\\.)|" + quotedNames + "|" + bareName);
+    }
+
+    private static String quotedToken(char quote, boolean backslashEscapes) {
+        String escape = backslashEscapes ? "\\\\.|" : "";
+        String ordinary = "[^" + quote + (backslashEscapes ? "\\\\" : "") + "]++";
+        return quote + "(?:" + quote + quote + "|" + escape + ordinary + ")*+" + quote;
+    }
+
+    private record CreateDefinition(String sql, String sqlMode) {}
 }

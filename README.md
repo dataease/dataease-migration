@@ -58,4 +58,4 @@ mvn -B -ntp clean package
 java -jar target/dataease-migration-1.1.jar
 ```
 
-首次运行 JAR 可从运维服务本机的 localhost 页面初始化管理员。Maven 发行 ZIP 同时包含 JAR 和迁移插件。运行 JAR 时以包含 `plugins/` 的目录为工作目录，或用 `MIGRATION_PLUGINS_DIRECTORY` 指定插件目录。Docker 和 JAR 均内置用于 MySQL 迁移的 JDBC 驱动。
+首次运行 JAR 可从运维服务本机的 localhost 页面初始化管理员。Maven 发行 ZIP 同时包含 JAR 和迁移插件。运行 JAR 时以包含 `plugins/` 的目录为工作目录，或用 `MIGRATION_PLUGINS_DIRECTORY` 指定插件目录。Docker 和 JAR 均通过内置 JDBC 驱动迁移 MySQL。
