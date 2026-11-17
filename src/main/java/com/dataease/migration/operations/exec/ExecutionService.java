@@ -3,6 +3,7 @@ package com.dataease.migration.operations.exec;
 import static com.dataease.migration.operations.exec.HostCommands.*;
 
 import com.dataease.migration.model.*;
+import com.dataease.migration.operations.core.OperationsApiException;
 import com.dataease.migration.operations.media.*;
 import com.dataease.migration.service.*;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -11,6 +12,7 @@ import org.springframework.stereotype.Service;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
+import java.security.MessageDigest;
 import java.sql.*;
 import java.util.*;
 import java.util.function.Consumer;
@@ -702,16 +704,101 @@ public class ExecutionService {
         if (!Objects.equals(before.get("version"), target.get("version")))
             throw new IllegalArgumentException("当前版本与回退离线包不一致。");
         validateUninstall(target, credentials); // Confirm the platform owns this exact deployment and CLI.
-        if (!rollback) {
-            try (Connection connection = database.connect(target, credentials); Statement statement = connection.createStatement()) {
-                statement.setQueryTimeout(10);
-                try (var rows = statement.executeQuery("SELECT COUNT(*) FROM xpack_plugin")) {
-                    if (!rows.next() || rows.getLong(1) != 0)
-                        throw new IllegalArgumentException("实例已安装插件，请使用原厂升级流程同步更新插件。");
+        new OfflineComposeInstaller(host, compose, json, database).verifyVendorUpgrade(before, after, target, credentials, rollback);
+    }
+
+    public String validateVendorUpgradePlugins(Map<String, Object> target, Map<String, String> credentials,
+            String releaseVersion) throws Exception {
+        var plugins = new ArrayList<UpgradePlugin>();
+        var incompatible = new ArrayList<String>();
+        try (Connection connection = database.connect(target, credentials);
+                PreparedStatement statement = connection.prepareStatement(
+                        "SELECT name, version, require_version, jar_name FROM xpack_plugin ORDER BY name, id")) {
+            statement.setQueryTimeout(10);
+            try (ResultSet rows = statement.executeQuery()) {
+                while (rows.next()) {
+                    String name = Objects.toString(rows.getString(1), "").strip();
+                    if (!name.matches("[\\p{L}\\p{M}\\p{N} ._+()（）-]{1,80}")) name = "未命名插件";
+                    String version = Objects.toString(rows.getString(2), "").strip();
+                    String label = version.matches("[vV]?\\d[0-9A-Za-z.+_-]{0,31}") ? name + " " + version : name;
+                    String issue = PluginInstaller.dataEaseVersionIssue(
+                            releaseVersion, Objects.toString(rows.getString(3), "").strip());
+                    String jar = Objects.toString(rows.getString(4), "");
+                    if (!issue.isEmpty()) incompatible.add(label + "（" + issue + "）");
+                    else if (jar.length() > 255 || !jar.endsWith(".jar") || jar.contains("/") || jar.contains("\\")
+                            || jar.chars().anyMatch(Character::isISOControl))
+                        incompatible.add(label + "（插件文件登记无效）");
+                    else plugins.add(new UpgradePlugin(label, jar));
                 }
             }
+        } catch (SQLException error) {
+            String detail = switch (error.getErrorCode()) {
+                case 1146 -> "元数据库缺少插件登记表，请核对当前实例的元数据库结构。";
+                case 1044, 1045, 1142 -> "MySQL 拒绝读取插件登记，请核对实例保存的数据库账号和读取权限。";
+                default -> error instanceof SQLTimeoutException
+                        ? "读取插件登记超时，请检查内置 MySQL 状态后重试。"
+                        : "无法读取插件登记，请先在实例管理验证数据库连接，再检查插件登记表是否可读。";
+            };
+            throw new SQLException(detail, error.getSQLState(), error.getErrorCode(), error);
         }
-        new OfflineComposeInstaller(host, compose, json, database).verifyVendorUpgrade(before, after, target, credentials, rollback);
+        if (!incompatible.isEmpty())
+            throw new IllegalArgumentException("有 " + incompatible.size() + " 个插件无法随升级保留："
+                    + summarizeUpgradePlugins(incompatible) + "。请在 DataEase 中核对插件并安装适配目标版本的插件。");
+        if (plugins.isEmpty()) return "未发现已登记插件。";
+        String directory = path(text(target, "path", "")) + "/data/plugin";
+        String jars = plugins.stream().map(UpgradePlugin::jar).distinct().map(HostCommands::quote)
+                .collect(java.util.stream.Collectors.joining(" "));
+        Set<String> unreadable = new HashSet<>(host.capture(target, credentials, "cd " + quote(directory)
+                + " 2>/dev/null || { printf '%s\\n' " + jars + "; exit 0; }; for jar in " + jars + "; do "
+                + "if ! test -f \"$jar\" || ! test -r \"$jar\" || ! test -s \"$jar\"; "
+                + "then printf '%s\\n' \"$jar\"; fi; done").lines().toList());
+        if (!unreadable.isEmpty()) {
+            var missing = plugins.stream().filter(plugin -> unreadable.contains(plugin.jar()))
+                    .map(UpgradePlugin::label).toList();
+            throw new IllegalArgumentException("以下插件文件缺失、为空或不可读："
+                    + summarizeUpgradePlugins(missing) + "。请在 DataEase 中修复插件后重试。");
+        }
+        String labels = summarizeUpgradePlugins(plugins.stream().map(UpgradePlugin::label).toList());
+        return "已核对 " + plugins.size() + " 个插件（" + labels
+                + "），目标版本满足插件声明，文件可读。升级保留现有插件，请在隔离验收时验证使用这些插件的业务。";
+    }
+
+    private record UpgradePlugin(String label, String jar) {}
+
+    private static String summarizeUpgradePlugins(List<String> labels) {
+        int displayed = Math.min(labels.size(), 5);
+        return String.join("、", labels.subList(0, displayed)) + (labels.size() > displayed ? "等" : "");
+    }
+
+    @SuppressWarnings("unchecked")
+    public Map<String, Object> recoverV2ComponentUpgrade(Map<String, Object> oldMedia, Map<String, Object> newMedia,
+            Map<String, Object> backup, Map<String, Object> original, Map<String, String> credentials,
+            Consumer<String> log) throws Exception {
+        var before = media.verifiedPackage(oldMedia);
+        var after = media.verifiedPackage(newMedia);
+        requireRollbackPackage(before, backup, original);
+        if (!DataEaseOfflinePackage.supportsV2ComponentUpgrade(before, after))
+            throw new IllegalArgumentException("升级与回退介质与原任务不一致。");
+        backups.verify(backup);
+        var runtime = compose.inspect(original, new LinkedHashMap<>(credentials));
+        verifyRestoreDeployment(original, runtime);
+        compose.stop(runtime, credentials, log);
+        var patch = new V2PatchUpgrade(host, compose, database);
+        patch.restore(runtime, credentials, log);
+        var restored = compose.inspect(original, new LinkedHashMap<>(credentials));
+        if (!Objects.equals(original.get("version"), restored.get("version")))
+            throw new IllegalStateException("旧版部署配置未成功恢复。");
+        var oldImage = (Map<String, Object>) ((Map<?, ?>) before.get("images")).get("database");
+        new OfflineComposeInstaller(host, compose, json, database).recreateV2Mysql(restored, credentials, oldImage);
+        var observed = inspectRecoveryTarget(original, credentials);
+        validateRestoreTarget(original, observed);
+        backups.restore(backup, observed.instance(), observed.credentials(), log);
+        service(observed.instance(), observed.credentials(), true, true, log);
+        var result = inspect(observed.instance(), observed.credentials());
+        validateRestoreTarget(original, result);
+        patch.removeRecoveredJournal(result.instance(), result.credentials());
+        log.accept("已核验旧版 DataEase、内置 MySQL、整体备份内容及隔离状态。");
+        return result.instance();
     }
 
     private void requireRollbackPackage(
@@ -1476,8 +1563,7 @@ public class ExecutionService {
                 try (PreparedStatement update = connection.prepareStatement(
                             "UPDATE per_user SET pwd=?,pwd_update_time=? WHERE id=1 AND BINARY account='admin' "
                                     + "AND enable=1 AND origin=0 AND pwd REGEXP '^[0-9a-f]{32}$'")) {
-                    String digest = HexFormat.of().formatHex(java.security.MessageDigest.getInstance("MD5")
-                            .digest(password.getBytes(StandardCharsets.UTF_8)));
+                    String digest = adminPasswordDigest(password);
                     update.setString(1, digest);
                     update.setLong(2, System.currentTimeMillis());
                     if (update.executeUpdate() != 1)
@@ -1498,6 +1584,129 @@ public class ExecutionService {
         try (var transport = new ContainerApplicationHttp(host, compose, i, c)) {
             adminSession(transport, json, "/de2api", password);
         }
+    }
+
+    public String verifySavedAdminLogin(Map<String, Object> expected, Map<String, String> credentials,
+            Map<String, String> candidates, boolean isolated) throws Exception {
+        var secrets = new LinkedHashMap<>(credentials);
+        var deployment = adminDeployment(expected, secrets, isolated);
+        var actual = deployment.instance();
+        String reference;
+        try (Connection connection = database.connect(actual, secrets)) {
+            verifyAdminDatabase(expected, actual, secrets, connection);
+            if (ComposeManager.isManagedEnterprise(actual)) {
+                reference = matchingAdminReference(candidates, localAdmin(connection).digest());
+            } else {
+                // Community editions can keep the admin password in application configuration.
+                reference = candidates.size() == 1 ? candidates.keySet().iterator().next() : "";
+            }
+        }
+        if (reference.isBlank()) throw new IllegalArgumentException("已保存的密码与当前账号无法匹配。");
+        try (var transport = new ContainerApplicationHttp(host, actual, secrets,
+                deployment.applicationContainer(), deployment.composeConfig())) {
+            adminSession(transport, json, "/de2api", candidates.get(reference));
+        }
+        return reference;
+    }
+
+    public void resetInstanceAdmin(Map<String, Object> expected, Map<String, String> credentials,
+            Map<String, String> candidates, String generated, boolean isolated,
+            Consumer<String> beforeWrite) throws Exception {
+        var secrets = new LinkedHashMap<>(credentials);
+        var deployment = adminDeployment(expected, secrets, isolated);
+        var actual = deployment.instance();
+        if (!ComposeManager.isManagedEnterprise(actual))
+            throw OperationsApiException.badRequest("此部署使用社区版登录配置，请在 DataEase 中维护管理员密码。");
+        try (Connection connection = database.connect(actual, secrets);
+                var transport = new ContainerApplicationHttp(host, actual, secrets,
+                        deployment.applicationContainer(), deployment.composeConfig())) {
+            verifyAdminDatabase(expected, actual, secrets, connection);
+            var previous = localAdmin(connection);
+            var next = new AdminAccount(adminPasswordDigest(generated), System.currentTimeMillis());
+            beforeWrite.accept(matchingAdminReference(candidates, previous.digest()));
+            try {
+                if (!replaceAdminAccount(connection, previous, next))
+                    throw OperationsApiException.conflict("管理员账号已变化，请重新打开实例后重试。");
+            } catch (SQLException uncertain) {
+                throw OperationsApiException.conflict("暂时无法确认密码是否写入。请先尝试查看已验证的密码。");
+            }
+            try {
+                adminSession(transport, json, "/de2api", generated);
+            } catch (Exception unverified) {
+                if (unverified instanceof InterruptedException) Thread.currentThread().interrupt();
+                try {
+                    if (replaceAdminAccount(connection, next, previous))
+                        throw OperationsApiException.conflict("新密码未通过登录验证，已恢复原密码。");
+                } catch (SQLException rollback) {
+                    unverified.addSuppressed(rollback);
+                }
+                throw OperationsApiException.conflict("新密码未通过登录验证，暂时无法确认账号状态。请重新核对实例。");
+            }
+        }
+    }
+
+    private ComposeManager.DeploymentInspection adminDeployment(Map<String, Object> expected,
+            Map<String, String> credentials, boolean isolated) throws Exception {
+        var deployment = compose.inspectDeployment(expected, credentials);
+        var actual = deployment.instance();
+        if (!"运行中".equals(actual.get("status")) || !"MySQL".equals(actual.get("dbType"))
+                || text(actual, "databaseService", "").isBlank() || !compose.isolationSupported(actual))
+            throw OperationsApiException.badRequest("请确认 DataEase 和受管 MySQL 已运行，再验证管理员账号。");
+        if (isolated) compose.verifyIsolation(actual, credentials);
+        return deployment;
+    }
+
+    private void verifyAdminDatabase(Map<String, Object> expected, Map<String, Object> actual,
+            Map<String, String> credentials, Connection connection) throws Exception {
+        actual.put("databaseIdentity", databaseIdentity(connection));
+        verifyManagedDatabaseIdentity(actual, credentials);
+        for (String field : List.of("hostIdentity", "databaseIdentity", "version", "path",
+                "composeProject", "applicationService", "databaseService"))
+            if (text(expected, field, "").isBlank() || !Objects.equals(expected.get(field), actual.get(field)))
+                throw OperationsApiException.conflict("实例或元数据库身份已变化，请验证并保存连接。");
+    }
+
+    private record AdminAccount(String digest, long updatedAt) {}
+
+    private static final String LOCAL_ADMIN = "id=1 AND BINARY account='admin' AND enable=1 AND origin=0";
+
+    private static AdminAccount localAdmin(Connection connection) throws SQLException {
+        try (var query = connection.prepareStatement("SELECT pwd,pwd_update_time FROM per_user WHERE " + LOCAL_ADMIN)) {
+            query.setQueryTimeout(10);
+            try (var rows = query.executeQuery()) {
+                if (rows.next()) {
+                    String digest = rows.getString(1);
+                    long time = rows.getLong(2);
+                    if (!rows.wasNull() && digest != null && digest.matches("[0-9a-f]{32}") && !rows.next())
+                        return new AdminAccount(digest, time);
+                }
+            }
+        }
+        throw OperationsApiException.badRequest("无法确认受支持且已启用的 DataEase 本地 admin 账号。");
+    }
+
+    private static boolean replaceAdminAccount(Connection connection, AdminAccount expected, AdminAccount next)
+            throws SQLException {
+        try (var update = connection.prepareStatement("UPDATE per_user SET pwd=?,pwd_update_time=? WHERE "
+                + LOCAL_ADMIN + " AND BINARY pwd=? AND pwd_update_time=?")) {
+            update.setQueryTimeout(10);
+            update.setString(1, next.digest());
+            update.setLong(2, next.updatedAt());
+            update.setString(3, expected.digest());
+            update.setLong(4, expected.updatedAt());
+            return update.executeUpdate() == 1;
+        }
+    }
+
+    private static String matchingAdminReference(Map<String, String> candidates, String digest) throws Exception {
+        for (var entry : candidates.entrySet())
+            if (adminPasswordDigest(entry.getValue()).equals(digest)) return entry.getKey();
+        return "";
+    }
+
+    private static String adminPasswordDigest(String password) throws java.security.NoSuchAlgorithmException {
+        return HexFormat.of().formatHex(MessageDigest.getInstance("MD5")
+                .digest(password.getBytes(StandardCharsets.UTF_8)));
     }
 
     static String adminSession(ContainerApplicationHttp transport, ObjectMapper json, String prefix,

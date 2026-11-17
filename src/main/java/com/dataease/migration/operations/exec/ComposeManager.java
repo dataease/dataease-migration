@@ -155,8 +155,16 @@ public class ComposeManager {
         };
     }
 
-    @SuppressWarnings("unchecked")
     public Map<String, Object> inspect(Map<String, Object> draft, Map<String, String> secrets)
+            throws Exception {
+        return inspectDeployment(draft, secrets).instance();
+    }
+
+    record DeploymentInspection(Map<String, Object> instance, Map<String, Object> composeConfig,
+                                String applicationContainer) {}
+
+    @SuppressWarnings("unchecked")
+    DeploymentInspection inspectDeployment(Map<String, Object> draft, Map<String, String> secrets)
             throws Exception {
         Map<String, Object> i = new LinkedHashMap<>(draft);
         i.entrySet()
@@ -218,6 +226,9 @@ public class ComposeManager {
         i.put("version", tag.startsWith("v") || tag.startsWith("dev") ? tag : "v" + tag);
         i.put("applicationService", app);
         i.put("databaseService", db == null ? "" : db);
+        i.remove("databaseImage");
+        if (db != null)
+            i.put("databaseImage", text((Map<?, ?>) services.get(db), "image", ""));
         i.put("composeFile", cfg.get("_composeFile"));
         i.put("composeFiles", cfg.get("_composeFiles"));
         i.put("composeProject", cfg.getOrDefault("name", Path.of(path).getFileName().toString()));
@@ -491,7 +502,7 @@ public class ComposeManager {
         i.remove("privateKey");
         i.remove("passphrase");
         i.remove("hostKey");
-        return i;
+        return new DeploymentInspection(i, cfg, id);
     }
 
     public boolean isolationSupported(Map<String, Object> i) {

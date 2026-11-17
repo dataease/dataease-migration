@@ -104,6 +104,14 @@ public final class OperationsController {
         return ResponseEntity.ok().header(HttpHeaders.CACHE_CONTROL, "no-store").body(operations.initialAdmin(id));
     }
 
+    @PostMapping("/instances/{id}/reset-admin")
+    public ResponseEntity<Map<String, String>> resetAdmin(@PathVariable String id,
+            @RequestBody Map<String, Object> input, HttpServletRequest request) {
+        authentication.requirePassword(adminPassword(input), request);
+        return ResponseEntity.ok().header(HttpHeaders.CACHE_CONTROL, "no-store")
+                .body(operations.resetDataEaseAdmin(id, input));
+    }
+
     private static String adminPassword(Map<String, Object> input) {
         return input.get("password") instanceof String password ? password : "";
     }

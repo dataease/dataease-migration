@@ -1,6 +1,7 @@
-import React, { useId, useEffect, useRef, useState } from "react";
+import React, { useId, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Icon, Button, Select, useDialogFocus } from "./ui";
 import { readPrivateKey } from "./api";
+import TaskStageList from "./TaskStageList";
 export { Icon, Button, Select, TimeSelect } from "./ui";
 export const tone = (value) =>
   ["失败", "异常", "校验失败", "blocked", "error", "fail"].includes(value)
@@ -22,7 +23,9 @@ export const taskInProgress = (task) =>
 
 export function taskActivity(task) {
   if (task.state === "queued") return { title: "等待执行", since: task.createdAt, waiting: true };
-  if (task.state === "aborting") return { title: "停止目标并结束验收", since: task.activityStartedAt };
+  if (task.state === "aborting") return {
+    title: task.currentStage || "停止目标并结束验收", since: task.activityStartedAt,
+  };
   if (task.state === "reconciling") return { title: "核查目标运行状态", since: task.reconciliation?.confirmedAt };
   const stage = task.stages?.find((item) => item.title === task.currentStage);
   if (task.currentCheck) return {
@@ -61,20 +64,41 @@ export function Elapsed({ since, label = "已用" }) {
 
 export function SubmissionProgress({ progress, onAction }) {
   const region = useRef(null);
-  useEffect(() => {
-    region.current?.scrollIntoView({ block: "nearest" });
-  }, []);
-  if (!progress) return null;
-  const { state, current, submission, startedAt } = progress;
+  const [expanded, setExpanded] = useState(null);
+  const state = progress?.state;
   const active = ["requesting", "queued", "running", "submitting", "reconnecting"].includes(state);
+  useLayoutEffect(() => {
+    const panel = region.current;
+    const pane = panel?.closest(".wf-content, .ap-dialog-body");
+    if (!pane) return;
+    const reveal = () => {
+      const bottom = panel.getBoundingClientRect().bottom - pane.getBoundingClientRect().bottom;
+      if (bottom > 0) pane.scrollTop += bottom + 8;
+    };
+    reveal();
+    if (!active) return;
+    const observer = new ResizeObserver(reveal);
+    observer.observe(panel);
+    return () => observer.disconnect();
+  }, [active]);
+  if (!progress) return null;
+  const { current, submission, startedAt } = progress;
   const checks = submission?.checks ?? progress.checks ?? [];
-  const visibleChecks = submission?.passed === false ? [...checks].sort(
-    (first, second) => Number(second.status === "blocked") - Number(first.status === "blocked"),
-  ) : checks;
+  const stages = checks.map((check) => ({
+    title: check.title || check.name,
+    status: check.status === "blocked" ? "failed" : check.status,
+    statusLabel: check.status === "blocked" ? "阻断" : check.status === "passed" ? "通过" : undefined,
+    detail: check.detail || check.message || check.remediation?.hint,
+    remediation: check.remediation,
+  }));
+  if (state === "running" && current) stages.push({ title: current, status: "running" });
+  const firstFailure = stages.findIndex((stage) => stage.status === "failed");
+  const selected = active ? -1 : expanded && expanded.id === progress.id
+    ? expanded.index : firstFailure;
   const label = {
     requesting: "正在提交请求",
     queued: "等待检查",
-    running: current ? `正在检查：${current}` : "正在检查执行条件",
+    running: "正在检查执行条件",
     submitting: "检查通过，正在创建任务",
     reconnecting: "正在重新获取任务状态",
     completed: submission?.passed ? "任务已创建" : "检查未通过，操作未执行",
@@ -84,12 +108,27 @@ export function SubmissionProgress({ progress, onAction }) {
     <section ref={region} className="submission-progress" aria-label="执行条件检查">
       <div className="wf-check-progress">
         <strong role="status">
-          {active && <span className="task-spinner" aria-hidden="true" />}
+          {active && (!current || state !== "running") && <span className="task-spinner" aria-hidden="true" />}
           {label}
         </strong>
         {active && <Elapsed since={startedAt} />}
       </div>
-      {visibleChecks.length > 0 && <CheckResults checks={visibleChecks} onAction={active ? undefined : onAction} />}
+      {stages.length > 0 && (
+        <TaskStageList stages={stages} label="检查步骤"
+          focusedIndex={active ? stages.length - 1 : selected}
+          selectedIndex={selected}
+          canSelect={(stage) => !active && Boolean(stage.detail || stage.remediation?.label)}
+          onSelect={(index) => setExpanded({ id: progress.id, index: selected === index ? -1 : index })}
+          renderDetail={(stage) => (
+            <div className="submission-step-detail">
+              {stage.detail && <p>{stage.detail}</p>}
+              {stage.remediation?.hint && stage.remediation.hint !== stage.detail && <p>{stage.remediation.hint}</p>}
+              {onAction && stage.remediation?.label && stage.remediation.type !== "manual" && (
+                <Button small onClick={() => onAction(stage.remediation)}>{stage.remediation.label}</Button>
+              )}
+            </div>
+          )} />
+      )}
     </section>
   );
 }
@@ -101,6 +140,20 @@ function DialogActivity({ children }) {
       <span role="status"><span className="task-spinner" aria-hidden="true" />{children}</span>
       <Elapsed since={started} />
     </span>
+  );
+}
+
+export function OperationFooter({ information, busyLabel, contextActions, children }) {
+  return (
+    <footer className="operation-footer">
+      {(busyLabel || information || contextActions) && (
+        <div className="operation-footer-context">
+          {busyLabel ? <DialogActivity>{busyLabel}</DialogActivity> : information}
+          {contextActions}
+        </div>
+      )}
+      <div className="operation-footer-actions">{children}</div>
+    </footer>
   );
 }
 
@@ -166,6 +219,7 @@ export function Modal({
   children,
   onClose,
   actions,
+  footer,
   wide = true,
   busy = false,
   busyLabel = "正在处理",
@@ -205,10 +259,10 @@ export function Modal({
             {children}
           </fieldset>
         </div>
-        <footer className="ap-dialog-footer">
+        {footer ?? <footer className="ap-dialog-footer">
           {busy && busyLabel && <DialogActivity>{busyLabel}</DialogActivity>}
           {actions || <Button onClick={onClose}>关闭</Button>}
-        </footer>
+        </footer>}
       </section>
     </div>
   );
@@ -298,20 +352,15 @@ export function WizardFrame({
             {error && <Notice tone="red">{error}</Notice>}
           </div>
         </div>
-        <footer className="wf-footer">
-          <span className="wf-footnote">
-            {busy ? busyLabel && <DialogActivity>{busyLabel}</DialogActivity> : steps.length > 1
-              ? `第 ${step + 1} 步，共 ${steps.length} 步` : null}
-          </span>
-          <div className="wf-footer-actions">
-            <Button disabled={busy} onClick={step ? onBack : onClose}>
-              {step ? "上一步" : "取消"}
-            </Button>
-            <Button primary disabled={busy || nextDisabled} onClick={onNext}>
-              {nextLabel || "下一步"}
-            </Button>
-          </div>
-        </footer>
+        <OperationFooter busyLabel={busy && busyLabel}
+          information={!busy && steps.length > 1 ? `第 ${step + 1} 步，共 ${steps.length} 步` : null}>
+          <Button disabled={busy} onClick={step ? onBack : onClose}>
+            {step ? "上一步" : "取消"}
+          </Button>
+          <Button primary disabled={busy || nextDisabled} onClick={onNext}>
+            {nextLabel || "下一步"}
+          </Button>
+        </OperationFooter>
       </section>
     </div>
   );
@@ -535,9 +584,9 @@ export function Endpoint({ instance, label, onManage }) {
     </section>
   );
 }
-export function Facts({ rows }) {
+export function Facts({ rows, className = "" }) {
   return (
-    <dl className="detail-list">
+    <dl className={`detail-list ${className}`}>
       {rows.map(([label, value]) => (
         <React.Fragment key={label}>
           <dt>{label}</dt>

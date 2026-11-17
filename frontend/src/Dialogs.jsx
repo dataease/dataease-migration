@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useId, useRef, useState } from "react";
 import { Badge } from "./ui";
 import {
   Button,
@@ -7,6 +7,7 @@ import {
   Check,
   Notice,
   Modal,
+  OperationFooter,
   CredentialFields,
   DatabaseFields,
   Facts,
@@ -623,34 +624,71 @@ export function ExportBackupDialog({ backup, onClose, onSaved }) {
   );
 }
 
-export function InstanceAdminDialog({ instance, uninstall, onClose, onQueued }) {
+export function InstanceAdminDialog({ instance, uninstall, reset, acceptanceTaskId, onClose, onQueued, onChanged }) {
   const [password, setPassword] = useState("");
   const [initialAdmin, setInitialAdmin] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const confirm = async () => {
+  const [copyStatus, setCopyStatus] = useState("");
+  const formId = useId();
+  const passwordInput = useRef(null);
+  const resultInput = useRef(null);
+  const submitting = useRef(false);
+  useEffect(() => {
+    if (!uninstall && !busy && error) passwordInput.current?.focus();
+  }, [uninstall, busy, error]);
+
+  const confirm = async (event) => {
+    event.preventDefault();
+    if (!password || submitting.current || initialAdmin) return;
+    submitting.current = true;
     setBusy(true);
     setError("");
     try {
-      const action = uninstall ? "uninstall" : "initial-admin";
-      const result = await post(`/instances/${instance.id}/${action}`, { password });
+      const action = uninstall ? "uninstall" : reset ? "reset-admin" : "initial-admin";
+      const result = await post(`/instances/${instance.id}/${action}`, reset
+        ? { password, confirmTargetName: instance.name, instanceRevision: instance.revision, acceptanceTaskId }
+        : { password });
       if (uninstall) onQueued(result);
-      else setInitialAdmin(result);
+      else {
+        setInitialAdmin(result);
+        if (reset) onChanged?.();
+      }
     } catch (failure) {
       setError(failure.message);
     } finally {
+      submitting.current = false;
       setPassword("");
       setBusy(false);
     }
   };
+  const copy = async () => {
+    try {
+      if (navigator.clipboard) await navigator.clipboard.writeText(initialAdmin.password);
+      else {
+        resultInput.current?.select();
+        if (!document.execCommand("copy")) throw new Error("copy failed");
+      }
+      setCopyStatus("已复制");
+    } catch {
+      resultInput.current?.select();
+      setCopyStatus("密码已选中，请手动复制。");
+    }
+  };
+  const passwordField = <Field label="运维中心 admin 密码" type="password" value={password}
+    autoComplete="current-password" ref={passwordInput} data-dialog-autofocus={!uninstall || undefined}
+    onChange={(event) => setPassword(event.target.value)} />;
   return (
-    <Modal title={uninstall ? "卸载 DataEase" : instance.hasMigratedInitialAdmin ? "查看迁入的初始密码" : "查看 DataEase 初始密码"} wide={false}
-      onClose={onClose} busy={busy} actions={
+    <Modal title={uninstall ? "卸载 DataEase" : reset ? "重置 DataEase 管理员密码" : "查看 DataEase 管理员密码"} wide={false}
+      onClose={onClose} busy={busy}
+      busyLabel={uninstall ? "正在处理" : reset ? "正在重置密码并验证登录" : "正在核对实例并验证登录"}
+      actions={
         <>
-          <Button onClick={onClose} disabled={busy}>{initialAdmin ? "关闭" : "取消"}</Button>
+          <Button type="button" onClick={onClose} disabled={busy}>{initialAdmin ? "关闭" : "取消"}</Button>
           {!initialAdmin && (
-            <Button primary disabled={busy || !password} onClick={confirm}>
-              {busy ? "正在确认…" : uninstall ? "确认卸载" : "验证并查看"}
+            <Button primary type={uninstall ? "button" : "submit"} form={uninstall ? undefined : formId}
+              disabled={busy || !password} onClick={uninstall ? confirm : undefined}>
+              {busy ? "正在确认…" : uninstall ? "确认卸载" : reset ? "重置并验证" : "验证并查看"}
             </Button>
           )}
         </>
@@ -659,17 +697,18 @@ export function InstanceAdminDialog({ instance, uninstall, onClose, onQueued }) 
       {uninstall && (
         <Notice tone="amber">移除该实例的容器、专用网络和闲置镜像，归档原数据。实例和连接设置会保留，状态变为「未安装」。Docker、Compose 和共享镜像会保留。</Notice>
       )}
+      {reset && !initialAdmin && <Notice tone="amber">此操作会替换目标实例的 DataEase admin 密码。新密码登录验证通过后可查看。</Notice>}
       {initialAdmin ? (
         <>
           <Facts rows={[["用户名", initialAdmin.username]]} />
-          <Field label={instance.hasMigratedInitialAdmin ? "已验证的 V2 初始密码" : "安装时生成的初始密码"}
-            value={initialAdmin.password} readOnly autoComplete="off" />
-          <Notice>如果已在 DataEase 内修改密码，请使用修改后的密码。</Notice>
+          <Field label={reset ? "已验证的新密码" : "已验证的密码"}
+            value={initialAdmin.password} readOnly autoComplete="off" ref={resultInput} />
+          <div className="button-row">
+            <Button small onClick={copy}>复制密码</Button>
+            {copyStatus && <span role="status">{copyStatus}</span>}
+          </div>
         </>
-      ) : (
-        <Field label="运维中心 admin 密码" type="password" value={password}
-          autoComplete="current-password" onChange={(event) => setPassword(event.target.value)} />
-      )}
+      ) : uninstall ? passwordField : <form id={formId} onSubmit={confirm}>{passwordField}</form>}
       {error && <Notice tone="red">{error}</Notice>}
     </Modal>
   );
@@ -678,13 +717,14 @@ export function InstanceAdminDialog({ instance, uninstall, onClose, onQueued }) 
 export function TaskDialog({
   task,
   state,
+  initialStage,
   onClose,
   onRefresh,
   onRestore,
   onAbort,
   onReconcile,
   onAutomation,
-  onInitialAdmin,
+  onInstanceAdmin,
 }) {
   const [releaseMode, setReleaseMode] = useState(task.acceptance?.releaseMode || "isolated");
   const [error, setError] = useState("");
@@ -716,8 +756,29 @@ export function TaskDialog({
   const canRecover = registeredTarget?.recoveryRequired && task.status === "失败" && task.dataChanged
     && protection && protection.restoreMode !== "manual"
     && state.tasks.find((item) => item.targetId === task.targetId && item.currentTarget !== false && item.dataChanged)?.targetBackupId === protectionId;
-  const results = task.report?.checks ??
-    (task.liveChecks?.length ? task.liveChecks : running ? [] : acceptance.checks ?? []);
+  const requiresReconciliation = task.state === "reconciliation_required";
+  const showAdminPassword = ["install", "migrate", "restore"].includes(task.kind)
+    && registeredTarget?.canViewDataEaseAdmin;
+  const showAdminReset = task.kind === "restore" && awaitingDecision && registeredTarget?.canResetDataEaseAdmin;
+  const contextActions = (canRecover || requiresReconciliation || awaitingDecision || showAdminPassword || showAdminReset) ? (
+    <>
+      {canRecover && (
+        <Button onClick={() => onRestore(protection, task.targetId, task.id, task.rollbackPackageId)}>
+          还原目标保护备份
+        </Button>
+      )}
+      {requiresReconciliation && (
+        <Button onClick={() => onReconcile(task)}>核查执行状态</Button>
+      )}
+      {awaitingDecision && (
+        <Button disabled={busy} onClick={() => onAbort(task)}>
+          {task.v2ComponentUpgrade ? "回退并结束验收" : "停止并结束验收"}
+        </Button>
+      )}
+      {showAdminPassword && <Button onClick={() => onInstanceAdmin(registeredTarget, "initial-admin")}>查看管理员密码</Button>}
+      {showAdminReset && <Button onClick={() => onInstanceAdmin(registeredTarget, "reset-admin", task.id)}>重置管理员密码</Button>}
+    </>
+  ) : null;
   const timeLabel = task.startedAt ? "开始时间" : "提交时间";
   const taskTime = task.startedAt || task.createdAt
     ? new Date(task.startedAt || task.createdAt).toLocaleString("zh-CN", { hour12: false })
@@ -728,40 +789,18 @@ export function TaskDialog({
         title={task.title || task.name || task.kind}
         onClose={onClose}
         busy={busy}
-        busyLabel="正在提交验收"
         className="task-dialog"
-        actions={
-          <>
+        footer={
+          <OperationFooter contextActions={contextActions} busyLabel={busy ? "正在提交验收" : null}>
             <Button disabled={busy} onClick={onClose}>
               关闭
             </Button>
-            {canRecover && (
-              <Button
-                onClick={() => onRestore(protection, task.targetId, task.id, task.rollbackPackageId)}
-              >
-                还原目标保护备份
-              </Button>
-            )}
-            {task.state === "reconciliation_required" && (
-              <Button onClick={() => onReconcile(task)}>核查执行状态</Button>
-            )}
-            {awaitingDecision && (
-              <Button disabled={busy} onClick={() => onAbort(task)}>
-                停止并结束验收
-              </Button>
-            )}
-            {["install", "migrate"].includes(task.kind)
-                && (registeredTarget?.hasInitialAdmin || registeredTarget?.hasMigratedInitialAdmin) && (
-              <Button onClick={() => onInitialAdmin(registeredTarget)}>
-                {registeredTarget.hasMigratedInitialAdmin ? "查看迁入的初始密码" : "查看初始密码"}
-              </Button>
-            )}
             {awaitingDecision && (
               <Button primary disabled={busy || !acceptanceReady} onClick={() => execute("complete")}>
                 {releaseMode === "open" ? "完成验收并开放访问" : "完成验收，保持隔离"}
               </Button>
             )}
-          </>
+          </OperationFooter>
         }
       >
         <div className="task-dialog-content">
@@ -782,10 +821,12 @@ export function TaskDialog({
               <div className="task-summary-id"><dt>任务编号</dt><dd>{task.id}</dd></div>
             </dl>
           </div>
-          <TaskExecution task={task} active={running} />
+          <TaskExecution task={task} active={running} initialStage={initialStage} />
           <div className="task-context" tabIndex={0} role="region" aria-label="补充任务信息">
-            {task.error && <Notice tone="red">{task.error}</Notice>}
-            {((task.status === "失败" && !["release", "backup", "check", "service", "uninstall"].includes(task.kind)) ||
+            {task.upgradeRecovered
+              ? <Notice>已回退到升级前的版本和数据，实例保持隔离运行。</Notice>
+              : task.error && <Notice tone="red">{task.error}</Notice>}
+            {((task.status === "失败" && !task.upgradeRecovered && !["release", "backup", "check", "service", "uninstall"].includes(task.kind)) ||
               task.state === "reconciliation_required") && (
               <Notice tone="amber">
                 {task.state === "reconciliation_required"
@@ -836,16 +877,14 @@ export function TaskDialog({
                   .map((job) => ({ title: job.name, status: "passed", detail: job.enabled ? "已恢复调度" : "后续调度已暂停" }))} />
               </>
             )}
-            {results.length > 0 && (
-              <details>
-                <summary>{task.kind === "check" ? "检查结果" : "运行核验结果"}</summary>
-                <CheckResults checks={results} />
-              </details>
-            )}
             {task.status === "待验收" && uninstalling && <Notice>该实例正在处理卸载，请在任务中心查看卸载任务。</Notice>}
             {awaitingDecision && (
               <section className="lc-acceptance">
                 <h3>{task.restorePurpose === "rehearsal" ? "演练验收" : "验收后的访问策略"}</h3>
+                {task.kind === "restore" && !registeredTarget?.canViewDataEaseAdmin && (
+                  <p>{task.restoredAdminAccount ? "请使用备份时的 DataEase 管理员密码。" : "请使用还原前的 DataEase 管理员密码。"}
+                    {showAdminReset && "忘记密码可在此重置。"}</p>
+                )}
                 {!acceptanceReady && (
                   <div className="button-row">
                     <Button disabled={busy} onClick={() => execute("check")}>重新核验</Button>

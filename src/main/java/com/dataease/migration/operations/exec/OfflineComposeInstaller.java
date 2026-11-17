@@ -41,16 +41,28 @@ final class OfflineComposeInstaller {
 
     void verifyVendorUpgrade(Map<String, Object> current, Map<String, Object> next,
             Map<String, Object> instance, Map<String, String> credentials, boolean rollback) throws Exception {
-        var previousFiles = deploymentInputs(current);
-        var nextFiles = deploymentInputs(next);
-        if (!previousFiles.equals(nextFiles))
+        var before = vendorImages(current, instance);
+        var after = vendorImages(next, instance);
+        String app = text(instance, "applicationService", "");
+        String mysql = text(instance, "databaseService", "");
+        boolean patch = !rollback && DataEaseOfflinePackage.supportsV2ComponentUpgrade(current, next);
+        for (var entry : before.entrySet()) {
+            String service = entry.getKey();
+            var image = entry.getValue();
+            var replacement = after.get(service);
+            if (!Set.of(app, "task-actuator").contains(service) && !(patch && service.equals(mysql))
+                    && (!Objects.equals(image.get("reference"), replacement.get("reference"))
+                        || !Objects.equals(image.get("id"), replacement.get("id")))) {
+                String name = service.equals(mysql) ? "内置 MySQL" : service;
+                throw new IllegalArgumentException("此次版本变更涉及 " + name + " 镜像（"
+                        + image.get("reference") + " → " + replacement.get("reference") + "），请使用 DataEase 原厂离线升级流程。");
+            }
+        }
+        if (!patch && !deploymentInputs(current).equals(deploymentInputs(next)))
             throw new IllegalArgumentException("此升级会改变原厂配置、网关文件或 JDBC 驱动。请使用原厂升级流程。");
         var live = compose.config(instance, credentials);
         if (!Boolean.TRUE.equals(live.get("_vendorEnterprise")) || !Objects.equals(live.get("name"), instance.get("composeProject")))
             throw new IllegalArgumentException("无法确认受管企业版 Compose 项目。");
-        var before = vendorImages(current, instance);
-        var after = vendorImages(next, instance);
-        String app = text(instance, "applicationService", "");
         String architecture = text(instance, "arch", "");
         if (!(live.get("services") instanceof Map<?, ?> services) || !before.keySet().equals(services.keySet()))
             throw new IllegalArgumentException("实际 Compose 服务组成与当前版本离线包不一致。");
@@ -67,11 +79,8 @@ final class OfflineComposeInstaller {
                     && (container.isBlank() || imageIdentityMatches(after.get(service), activeImage));
             if (!imageIdentityMatches(image, activeImage) && !unchangedContainer)
                 throw new IllegalArgumentException("实际 " + service + " 容器与当前版本离线包不一致，无法保证回退。");
-            if (!Set.of(app, "task-actuator").contains(service)
-                    && (!Objects.equals(image.get("reference"), after.get(service).get("reference"))
-                        || !Objects.equals(image.get("id"), after.get(service).get("id"))))
-                throw new IllegalArgumentException("升级包会替换 " + service + "，请使用原厂升级流程。");
         }
+        if (patch) new V2PatchUpgrade(host, compose, database).verifySource(instance, credentials);
     }
 
     private Map<String, Object> deploymentInputs(Map<String, Object> pkg) throws Exception {
@@ -121,6 +130,9 @@ final class OfflineComposeInstaller {
             var extra = (Map<String, Map<String, Object>>) pkg.get("enterpriseImages");
             required.add(extra.get("task-actuator"));
         }
+        boolean patch = ComposeManager.isVendorEnterprise(instance)
+                && DataEaseOfflinePackage.supportsV2ComponentUpgrade(text(instance, "version", ""), pkg);
+        if (patch) required.add(images.get("database"));
         String architecture = text(instance, "arch", "");
         var archives = new LinkedHashMap<String, Object>();
         for (var image : required) {
@@ -147,6 +159,11 @@ final class OfflineComposeInstaller {
         importPhase.add(transferTmp);
         var rollback = new ArrayList<>(docker);
         rollback.addAll(List.of(resourceTmp, deployment, mysql));
+        if (patch) {
+            long bytes = Long.parseLong(host.capture(instance, credentials,
+                    "du -sb -- " + quote(backup.databaseDirectory())).split("\\s+")[0]);
+            rollback.add(new UpgradeCapacity.Demand(backup.databaseDirectory(), "旧 MySQL 冷副本", bytes));
+        }
         return UpgradeCapacity.requireSpace(host, instance, credentials, backup.repository(), backup.repositoryBytes(),
                 List.of(new UpgradeCapacity.Demand("/tmp", "目标临时目录", resources)),
                 importPhase, rollback);
@@ -172,6 +189,8 @@ final class OfflineComposeInstaller {
         Map<String, Map<String, Object>> enterprise = pkg.get("enterpriseImages") instanceof Map<?, ?> entries
                 ? (Map<String, Map<String, Object>>) entries : Map.of();
         boolean vendorRelease = upgrade && ComposeManager.isVendorEnterprise(config);
+        boolean patch = vendorRelease
+                && DataEaseOfflinePackage.supportsV2ComponentUpgrade(text(config, "version", ""), pkg);
         if (!upgrade) {
             if (!credentials.getOrDefault("dbUser", text(config, "dbUser", "")).equals("root"))
                 throw new IllegalArgumentException("内置 MySQL 安装请使用 root 管理账号");
@@ -193,6 +212,7 @@ final class OfflineComposeInstaller {
                 requiredImages.add(dbImage);
                 requiredImages.addAll(enterprise.values());
             }
+            if (patch) requiredImages.add(dbImage);
             String arch = text(pkg, "arch", "");
             boolean reusedImage = false;
             for (Map<String, Object> image : requiredImages) {
@@ -235,14 +255,19 @@ final class OfflineComposeInstaller {
             progress.start(WRITE_CONFIG, 60);
             if (vendorRelease) {
                 compose.verifyStopped(config, credentials);
-                String release = target + "/" + ComposeManager.RELEASE_OVERRIDE;
-                String staged = release + "-" + UUID.randomUUID();
-                var updated = Map.of("services", Map.of("dataease", Map.of("image", appImage.get("reference")),
-                        "task-actuator", Map.of("image", enterprise.get("task-actuator").get("reference"))));
-                upload(config, credentials, json.writeValueAsBytes(updated), staged);
-                host.run(config, credentials, "test ! -L " + quote(release) + " && mv -fT -- "
-                        + quote(staged) + " " + quote(release), line -> {});
-                updateVendorDectl(config, credentials, target);
+                if (patch) {
+                    progress.detail("保存旧版配置和 MySQL 数据目录，准备原厂补丁配置。");
+                    applyV2Patch(config, credentials, appImage, dbImage, enterprise.get("task-actuator"), log);
+                } else {
+                    String release = target + "/" + ComposeManager.RELEASE_OVERRIDE;
+                    String staged = release + "-" + UUID.randomUUID();
+                    var updated = Map.of("services", Map.of("dataease", Map.of("image", appImage.get("reference")),
+                            "task-actuator", Map.of("image", enterprise.get("task-actuator").get("reference"))));
+                    upload(config, credentials, json.writeValueAsBytes(updated), staged);
+                    host.run(config, credentials, "test ! -L " + quote(release) + " && mv -fT -- "
+                            + quote(staged) + " " + quote(release), line -> {});
+                    updateVendorDectl(config, credentials, target);
+                }
             } else if (upgrade) {
                 Map<String, Object> cfg = compose.config(config, credentials);
                 Map<String, Object> services = (Map<String, Object>) cfg.get("services");
@@ -297,7 +322,8 @@ final class OfflineComposeInstaller {
                     ? DataEaseOfflinePackage.ADAPTER : ComposeManager.VENDOR_ENTERPRISE_ADAPTER);
             config.put("version", version);
             config.put("applicationService", "dataease");
-            progress.complete(vendorRelease ? "已更新应用和同步执行器的独立版本配置。"
+            progress.complete(patch ? "已升级并核验内置 MySQL，原数据目录已保留。"
+                    : vendorRelease ? "已更新应用和同步执行器的独立版本配置。"
                     : upgrade ? "应用镜像配置和数据库驱动已更新。"
                     : "部署配置、内置资源和数据库驱动已准备完成。");
             progress.start(verifyEnvironmentStage(upgrade), 75);
@@ -831,6 +857,38 @@ final class OfflineComposeInstaller {
             Files.deleteIfExists(temp);
             Files.deleteIfExists(directory);
         }
+    }
+
+    private void applyV2Patch(Map<String, Object> i, Map<String, String> c,
+            Map<String, Object> app, Map<String, Object> mysql, Map<String, Object> sync,
+            Consumer<String> log) throws Exception {
+        var patch = new V2PatchUpgrade(host, compose, database);
+        patch.stage(i, c, log);
+        String base = path(text(i, "path", ""));
+        String db = text(i, "databaseService", "");
+        var authentication = Map.of("DE_SYNC_AUTH_ENABLED", "${DE_SYNC_AUTH_ENABLED:-false}",
+                "DE_SYNC_AUTH_SECRET", "${DE_SYNC_AUTH_SECRET:-}");
+        var services = Map.of("dataease", Map.of("image", app.get("reference"), "environment", authentication,
+                    "volumes", List.of(base + "/data/report:/opt/dataease2.0/data/report",
+                            base + "/data/report-artifacts:/opt/dataease2.0/data/report-artifacts")),
+                "task-actuator", Map.of("image", sync.get("reference"), "environment", authentication),
+                db, Map.of("image", mysql.get("reference")));
+        upload(i, c, json.writeValueAsBytes(Map.of("services", services)),
+                V2PatchUpgrade.recoveryPath(i) + "/release.next");
+        patch.activate(i, c, log);
+        var actual = compose.inspect(i, new LinkedHashMap<>(c));
+        log.accept("正在启动新版内置 MySQL，并核对实际数据库版本和身份。");
+        recreateV2Mysql(actual, c, mysql);
+        i.putAll(actual);
+    }
+
+    void recreateV2Mysql(Map<String, Object> i, Map<String, String> c, Map<String, Object> image) throws Exception {
+        String name = text(i, "databaseService", "");
+        host.run(i, c, compose.command(i) + " up -d --pull never --no-deps --force-recreate " + quote(name), line -> {});
+        awaitDatabase(i, c);
+        var details = compose.container(i, c, compose.containerId(i, c, name));
+        if (!imageIdentityMatches(image, details.get("Image")))
+            throw new IllegalStateException("内置 MySQL 运行镜像与离线包不一致。");
     }
 
     private void awaitDatabase(Map<String, Object> i, Map<String, String> c) throws Exception {

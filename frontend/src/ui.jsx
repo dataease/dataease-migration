@@ -27,6 +27,10 @@ import {
   ArrowsLeftRight,
   Check,
   ShieldCheck,
+  ArrowUp,
+  LockOpen,
+  Power,
+  Trash,
 } from "@phosphor-icons/react";
 const icons = {
   overview: SquaresFour,
@@ -50,6 +54,10 @@ const icons = {
   migrate: ArrowsLeftRight,
   check: Check,
   shield: ShieldCheck,
+  upgrade: ArrowUp,
+  unlock: LockOpen,
+  power: Power,
+  trash: Trash,
 };
 export function Icon({ name = "info", size = 18, ...props }) {
   const Component = icons[name] || Info;

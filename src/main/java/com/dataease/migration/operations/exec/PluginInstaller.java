@@ -149,19 +149,25 @@ final class PluginInstaller {
         Map<String, Object> verified = media.verify(plugin);
         if (!Boolean.TRUE.equals(verified.get("installSupported")))
             throw new IllegalArgumentException("插件缺少受支持的原生描述");
-        String version = text(i, "version", "").replaceFirst("^v", "");
-        String required = text(verified, "requireVersion", "").replaceFirst("^v", "");
-        if (!version.matches("[23]\\.\\d+\\.\\d+")
-                || !required.matches("[23]\\.\\d+\\.\\d+")
-                || version.charAt(0) != required.charAt(0))
-            throw new IllegalArgumentException("插件与目标DataEase主版本不匹配");
-        String[] a = version.split("\\."), b = required.split("\\.");
-        for (int n = 0; n < 3; n++) {
-            int compare = Integer.compare(Integer.parseInt(a[n]), Integer.parseInt(b[n]));
-            if (compare < 0) throw new IllegalArgumentException("目标DataEase低于插件要求的最低版本");
-            if (compare > 0) break;
-        }
+        String issue = dataEaseVersionIssue(text(i, "version", ""), text(verified, "requireVersion", ""));
+        if (!issue.isEmpty()) throw new IllegalArgumentException(issue);
         return verified;
+    }
+
+    static String dataEaseVersionIssue(String targetVersion, String minimumVersion) {
+        String target = targetVersion.replaceFirst("^[vV]", "");
+        String minimum = minimumVersion.replaceFirst("^[vV]", "");
+        String versionPattern = "[23]\\.\\d{1,8}\\.\\d{1,8}";
+        if (!target.matches(versionPattern)) return "无法识别目标 DataEase 版本";
+        if (!minimum.matches(versionPattern)) return "缺少可识别的最低 DataEase 版本声明";
+        if (target.charAt(0) != minimum.charAt(0)) return "声明适用于 DataEase V" + minimum.charAt(0);
+        String[] actual = target.split("\\."), required = minimum.split("\\.");
+        for (int n = 1; n < 3; n++) {
+            int comparison = Integer.compare(Integer.parseInt(actual[n]), Integer.parseInt(required[n]));
+            if (comparison < 0) return "要求 DataEase v" + minimum + " 或更新版本";
+            if (comparison > 0) break;
+        }
+        return "";
     }
 
     private JsonNode request(

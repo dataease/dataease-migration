@@ -2281,14 +2281,6 @@ select {
   color: #459567;
   font-size: 11px;
 }
-.instance-operation-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 12px;
-}
-.instance-operation-grid > .button {
-  justify-content: flex-start;
-}
 .backup-plan {
   padding: 0 0 22px;
   margin-bottom: 22px;

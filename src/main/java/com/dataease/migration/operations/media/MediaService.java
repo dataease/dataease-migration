@@ -139,6 +139,8 @@ public final class MediaService {
         var result = new LinkedHashMap<>(verifiedPackage(record));
         if (!DataEaseOfflinePackage.ADAPTER.equals(result.get("adapter")))
             throw bad("此介质需要由提供方通过完整执行清单声明升级兼容性。");
+        if (Boolean.TRUE.equals(result.get("builtinUpgradeCompatibility")))
+            throw bad("平台已识别此离线包的升级来源版本。");
         String minimum = version(requested);
         String target = version(result.get("version"));
         if (!minimum.substring(0, 3).equals(target.substring(0, 3)))
@@ -447,8 +449,19 @@ public final class MediaService {
                 if (!packageRoot.startsWith(content)) return record;
                 result.putAll(DataEaseOfflinePackage.deploymentMetadata(packageRoot, text(record.get("version"))));
             }
-            if ("enterprise".equals(result.get("edition")))
-                result.put("purposes", DataEaseOfflinePackage.managedEnterprisePurposes(result));
+            if ("enterprise".equals(result.get("edition"))) {
+                String knownMinimum = DataEaseOfflinePackage.knownUpgradeMinimum(result);
+                String declaredMinimum = text(result.get("minimumUpgradeSource"));
+                if (!knownMinimum.isEmpty() && (declaredMinimum.isEmpty()
+                        || compareVersions(version(declaredMinimum), knownMinimum) <= 0)) {
+                    result.put("minimumUpgradeSource", knownMinimum);
+                    result.put("builtinUpgradeCompatibility", true);
+                }
+                if (DataEaseOfflinePackage.supportsV2ComponentUpgrade("v2.10.26", result))
+                    result.put("componentUpgradeFrom", "v2.10.26");
+            }
+            if ("builtin".equals(result.get("manifestSource")))
+                result.put("purposes", DataEaseOfflinePackage.managedPurposes(result));
             return result;
         } catch (Exception unavailable) {
             return record;

@@ -21,16 +21,25 @@ final class ContainerApplicationHttp implements AutoCloseable {
     private final int port;
     private final Path local;
 
-    @SuppressWarnings("unchecked")
     ContainerApplicationHttp(
             HostCommands host, ComposeManager compose, Map<String, Object> i, Map<String, String> c)
             throws Exception {
+        this(host, i, c, requireContainer(compose.containerId(i, c, text(i, "applicationService", ""))),
+                compose.config(i, c));
+    }
+
+    private static String requireContainer(String container) {
+        if (container.isBlank()) throw new IllegalArgumentException("目标应用容器尚未启动");
+        return container;
+    }
+
+    @SuppressWarnings("unchecked")
+    ContainerApplicationHttp(HostCommands host, Map<String, Object> i, Map<String, String> c,
+            String container, Map<String, Object> cfg) throws Exception {
         this.host = host;
         instance = i;
         credentials = c;
-        container = compose.containerId(i, c, text(i, "applicationService", ""));
-        if (container.isBlank()) throw new IllegalArgumentException("目标应用容器尚未启动");
-        Map<String, Object> cfg = compose.config(i, c);
+        this.container = requireContainer(container);
         Map<String, Object> services = (Map<String, Object>) cfg.get("services");
         Map<String, Object> app = (Map<String, Object>) services.get(i.get("applicationService"));
         List<?> ports = app.get("ports") instanceof List<?> list ? list : List.of();

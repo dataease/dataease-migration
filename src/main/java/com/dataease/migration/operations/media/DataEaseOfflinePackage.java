@@ -192,13 +192,13 @@ public final class DataEaseOfflinePackage {
         result.put("arch", arch);
         result.putAll(deploymentMetadata(root, version));
         boolean enterprise = "enterprise".equals(result.get("edition"));
-        result.put("purposes", List.of("install", "restore"));
         result.put("offlineComplete", true);
         result.put("operationsProtocol", 1);
         result.put("deployment", "single-compose");
         result.put("adapter", ADAPTER);
         result.put("images", Map.of("application", app, "database", database));
         if (enterprise) result.put("enterpriseImages", enterpriseImages(root, enterpriseImages, arch, version));
+        result.put("purposes", managedPurposes(result));
         result.put("bundledDocker", bundledDocker(root, arch));
         result.put("files", hashes);
         return result;
@@ -317,18 +317,45 @@ public final class DataEaseOfflinePackage {
 
     public static void requireManagedDeployment(Map<String, Object> pkg, String purpose) {
         if (ADAPTER.equals(pkg.get("adapter")) && "enterprise".equals(pkg.get("edition"))
-                && !managedEnterprisePurposes(pkg).contains(purpose)) {
-            if ("upgrade".equals(purpose) && managedEnterprisePurposes(pkg).contains("restore"))
-                throw new IllegalArgumentException("请在软件包详情填写介质提供方验证的最低可升级来源版本。");
+                && !managedPurposes(pkg).contains(purpose)) {
             throw new IllegalArgumentException("企业版需要包含全部配套服务的完整离线包。");
         }
     }
 
-    static List<String> managedEnterprisePurposes(Map<String, Object> pkg) {
-        if (!(pkg.get("enterpriseImages") instanceof Map<?, ?> images)
-                || !images.keySet().equals(ENTERPRISE_SERVICES.keySet())) return List.of();
-        return pkg.containsKey("minimumUpgradeSource") ? List.of("install", "restore", "upgrade")
-                : List.of("install", "restore");
+    static List<String> managedPurposes(Map<String, Object> pkg) {
+        if ("enterprise".equals(pkg.get("edition"))
+                && (!(pkg.get("enterpriseImages") instanceof Map<?, ?> images)
+                    || !images.keySet().equals(ENTERPRISE_SERVICES.keySet()))) return List.of();
+        if (Set.of("community", "enterprise").contains(String.valueOf(pkg.get("edition")))
+                || pkg.containsKey("minimumUpgradeSource")) return List.of("install", "restore", "upgrade");
+        return List.of("install", "restore");
+    }
+
+    public static boolean supportsAutomaticUpgradeChecks(Map<String, Object> pkg) {
+        return ADAPTER.equals(pkg.get("adapter")) && "builtin".equals(pkg.get("manifestSource"))
+                && Set.of("community", "enterprise").contains(String.valueOf(pkg.get("edition")))
+                && managedPurposes(pkg).contains("upgrade");
+    }
+
+    static String knownUpgradeMinimum(Map<String, Object> pkg) {
+        // Recognize the maintenance-line upgrade from 2.10.26 / 2.10.27 to 2.10.28.
+        if (ADAPTER.equals(pkg.get("adapter")) && "builtin".equals(pkg.get("manifestSource"))
+                && "enterprise".equals(pkg.get("edition")) && "已校验".equals(pkg.get("status"))
+                && "v2.10.28".equals(pkg.get("version"))
+                && managedPurposes(pkg).contains("restore")) return "v2.10.26";
+        return "";
+    }
+
+    public static boolean supportsV2ComponentUpgrade(String from, Map<String, Object> target) {
+        return "v2.10.26".equals(from) && "v2.10.28".equals(target.get("version"))
+                && "x86_64".equals(target.get("arch")) && "enterprise".equals(target.get("edition"))
+                && ADAPTER.equals(target.get("adapter"))
+                && "7a859a1d17def53591c3ced90aa04b0d54c825670b64eb4da3d64e8bbce252a3".equals(target.get("sha256"));
+    }
+
+    public static boolean supportsV2ComponentUpgrade(Map<String, Object> source, Map<String, Object> target) {
+        return supportsV2ComponentUpgrade(String.valueOf(source.get("version")), target)
+                && "8b655ae80a873f6243e9483b755cc641fe95fefc4a6753a1e2661a861cb38b58".equals(source.get("sha256"));
     }
 
     private static String normalizeReference(String reference) {

@@ -356,7 +356,6 @@ body {
   line-height: 20px;
   margin-bottom: 16px;
 }
-.wf-footer,
 .lc-dialog-footer,
 .ap-dialog-footer,
 .pk-dialog-footer,
@@ -373,7 +372,6 @@ body {
   border-top: 1px solid #e8eaed;
   flex-wrap: wrap;
 }
-.wf-footer > .wf-footnote,
 .lc-dialog-footer > span {
   margin-right: auto;
   min-width: 0;
@@ -381,7 +379,6 @@ body {
   font-size: var(--text-caption-size);
   color: var(--text-muted);
 }
-.wf-footer .button,
 .lc-dialog-footer .button,
 .ap-dialog-footer .button,
 .pk-dialog-footer .button,
@@ -398,13 +395,6 @@ body {
   text-align: center;
   flex-shrink: 0;
   margin: 0;
-}
-.wf-footer-actions {
-  gap: 10px;
-  min-width: 0;
-  max-width: 100%;
-  justify-content: flex-end;
-  flex-wrap: wrap;
 }
 .wf-error {
   font-size: var(--text-support-size);
@@ -762,12 +752,10 @@ body {
   .lc-identity > span {
     display: none;
   }
-  .wf-footer,
   .lc-dialog-footer,
   .ap-dialog-footer {
     gap: 8px;
   }
-  .wf-footer .button,
   .lc-dialog-footer .button,
   .ap-dialog-footer .button,
   .pk-dialog-footer .button {
@@ -824,7 +812,6 @@ body {
     --dialog-header: 52px;
     --dialog-footer: 52px;
   }
-  .wf-footer,
   .lc-dialog-footer,
   .ap-dialog-footer {
     padding-block: 8px;

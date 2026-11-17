@@ -14,7 +14,7 @@ import {
   SubmissionProgress,
   backupLocation,
 } from "./components";
-import { post, put } from "./api";
+import { post } from "./api";
 import { useTaskSubmission } from "./useTaskSubmission";
 import { UploadDialog } from "./Dialogs";
 import { canRebuildFromBackup } from "./backupProtection";
@@ -38,7 +38,6 @@ const compareVersions = (first, second) => {
   if (!a || !b) return null;
   return a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
 };
-const canDeclareUpgrade = (item) => item?.adapter === builtinAdapter && item.status === "已校验";
 const installDefaults = (media) => ({
   path: isV2(media?.version) ? "/opt/dataease2.0" : "/opt/dataease3.0",
   dbName: media?.edition === "enterprise" ? media.defaultDatabaseName || "dataease"
@@ -120,7 +119,6 @@ export default function Workflow({
     [retention, setRetention] = useState(7),
     [confirm, setConfirm] = useState(""),
     [busy, setBusy] = useState(false),
-    [minimum, setMinimum] = useState(null),
     [error, setError] = useState(""),
     [upload, setUpload] = useState(false);
   const existingMigration = kind === "migrate" && targetMode === "managed";
@@ -183,7 +181,6 @@ export default function Workflow({
   const builtinInstall = kind === "install" && config.dbMode === "builtin";
   const builtinRestore = freshRestore && media?.adapter === builtinAdapter && (reuseVacant || originalEnterprise);
   const selectMedia = (item) => {
-    setMinimum(null);
     change(setPackageId, item?.id || "");
     if (kind !== "install") {
       if (item?.adapter === builtinAdapter && kind === "restore")
@@ -268,21 +265,6 @@ export default function Workflow({
     "upgrade",
     "plugin",
   ].includes(kind);
-  const selectedMinimum = minimum ?? media?.minimumUpgradeSource ?? "";
-  const saveUpgradeCompatibility = async () => {
-    const value = selectedMinimum.trim();
-    if (!versionParts(value)) throw new Error("请输入完整版本号，例如 v3.0.0。");
-    if (versionParts(value)[0] !== versionParts(media.version)?.[0] || compareVersions(value, media.version) >= 0)
-      throw new Error("最低来源版本须与升级包主版本相同，并低于升级包版本。");
-    if (compareVersions(source.version, value) < 0)
-      throw new Error(`当前实例 ${source.version} 低于声明的最低来源版本。`);
-    if (compareVersions(value, media.minimumUpgradeSource) === 0) return;
-    await put(`/packages/${media.id}/upgrade-compatibility`, {
-      minimumUpgradeSource: value, sha256: media.sha256, revision: media.revision ?? 0,
-    });
-    await onRefresh();
-    setMinimum(null);
-  };
   const next = async () => {
     setError("");
     if (step === 0) {
@@ -295,16 +277,6 @@ export default function Workflow({
         (!media || mediaUnavailable(media))
       )
         return setError("请选择软件包库中的已校验介质。");
-      if (kind === "upgrade" && canDeclareUpgrade(media)) {
-        setBusy(true);
-        try {
-          await saveUpgradeCompatibility();
-        } catch (failure) {
-          return setError(failure.message);
-        } finally {
-          setBusy(false);
-        }
-      }
       if (kind === "install" && !reuseVacant)
         return setError("安装目标须处于未安装状态，请刷新实例列表。");
     }
@@ -446,8 +418,10 @@ export default function Workflow({
         return "版本类型不匹配";
       if (compareVersions(item.version, source.version) <= 0)
         return "须高于当前版本";
+      if (item.minimumUpgradeSource && compareVersions(source.version, item.minimumUpgradeSource) < 0)
+        return `来源须为 ${item.minimumUpgradeSource} 或更高版本`;
     }
-    if (kind === "upgrade" && !canDeclareUpgrade(item) && !item.purposes?.includes("upgrade"))
+    if (kind === "upgrade" && !item.purposes?.includes("upgrade"))
       return "此包未支持离线升级";
     if (
       kind === "plugin" &&
@@ -481,8 +455,7 @@ export default function Workflow({
                 disabled={!!mediaUnavailable(item)}
               >
                 {item.name || item.fileName} · {item.version} ·{" "}
-                {item.arch || "插件"} · {mediaUnavailable(item) ||
-                  (kind === "upgrade" && canDeclareUpgrade(item) && !item.minimumUpgradeSource ? "待补兼容声明" : item.status)}
+                {item.arch || "插件"} · {mediaUnavailable(item) || item.status}
               </option>
             ))}
           </Select>
@@ -498,13 +471,6 @@ export default function Workflow({
                 : "暂无可用软件包，上传后可继续当前操作。"}
           </small>}
         </div>
-        {kind === "upgrade" && canDeclareUpgrade(media) && (
-          <Field label="最低可升级来源版本" placeholder="例如 v3.0.0"
-            value={selectedMinimum}
-            onChange={(event) => change(setMinimum, event.target.value)}
-            hint="填写介质提供方已验证的版本。点击下一步将保存到软件包库。"
-            autoComplete="off" />
-        )}
         {media && !freshRestore && (
           <Facts
             rows={[
@@ -1148,7 +1114,7 @@ export default function Workflow({
                   targetName,
                 ],
                 ["目标服务器", target?.host || config.host || source?.host],
-                ...(kind === "upgrade" ? [["当前版本", source?.version], ["最低来源版本", media?.minimumUpgradeSource]] : []),
+                ...(kind === "upgrade" ? [["当前版本", source?.version]] : []),
                 [
                   "目标版本",
                   kind === "restore"
@@ -1174,7 +1140,9 @@ export default function Workflow({
             {["install", "upgrade", "restore"].includes(kind) && (
               <Notice tone="amber">
                 {kind === "upgrade"
-                  ? "停服前核查磁盘空间，随后建立整体保护备份。升级后先隔离运行，自动任务保持暂停，验收后可开放访问。"
+                  ? media?.componentUpgradeFrom === source?.version
+                    ? "停服前核查磁盘空间，随后建立整体保护备份。平台会升级内置 MySQL 和同步执行器，保留旧数据目录。升级后先隔离验收，执行失败时回退到旧版。"
+                    : "后台先核对升级条件与磁盘空间，通过后才停服并创建整体备份。升级后先隔离运行，验收后可开放访问。"
                   : kind === "restore" && purpose === "rehearsal"
                   ? "验收后仍保持隔离，业务入口关闭，自动任务暂停。"
                   : "目标变更完成后先隔离运行，自动任务保持暂停，完成业务验收后可开放访问。"}

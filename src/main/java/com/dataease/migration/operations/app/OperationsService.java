@@ -53,6 +53,11 @@ public final class OperationsService {
     private static final String VERIFY_MIGRATED_EXCEL_STAGE = "复核 V3 的 Excel / CSV 查询";
     private static final String STOP_SOURCE_MYSQL_STAGE = "停止原 V2 内置 MySQL";
     private static final String ABORT_ACCEPTANCE_STAGE = "停止目标并结束验收";
+    private static final String UPGRADE_ROLLBACK_STAGE = "恢复升级前的版本和数据";
+    private static final String UPGRADE_TARGET_RECHECK = "复核升级目标";
+    private static final String UPGRADE_PLUGINS_RECHECK = "复核企业版插件兼容性";
+    private static final String UPGRADE_ROLLBACK_RECHECK = "复核原厂部署与回退条件";
+    private static final String UPGRADE_SPACE_RECHECK = "复核升级磁盘空间";
     private static final String RECONCILE_STAGE = "核查目标运行状态";
     private static final Set<String> KINDS =
             Set.of(
@@ -81,6 +86,7 @@ public final class OperationsService {
     private final MediaService media;
     private final ObjectMapper mapper;
     private final OperationsProperties properties;
+    private final Set<String> adminOperations = ConcurrentHashMap.newKeySet();
     private final ExecutorService executor =
             new ThreadPoolExecutor(
                     4,
@@ -147,6 +153,7 @@ public final class OperationsService {
                     neverStarted
                             ? "运维服务重启；该排队任务没有开始执行，未自动续跑，请重新预检查。"
                             : "只读检查在服务重启时中断，未自动续跑，可重新运行检查。");
+            markStageFailed(task, text(task, "error"));
             if (neverStarted && !map(map(task, "command"), "registeredHostSnapshot").isEmpty())
                 store.saveInstanceAndTask(map(map(task, "command"), "registeredHostSnapshot"), task);
             else store.put("tasks", text(task, "id"), task);
@@ -216,6 +223,13 @@ public final class OperationsService {
                         if (!migrationInitialAdminReference(accounts).isBlank())
                             instance.put("hasMigratedInitialAdmin", true);
                     }
+                    var refs = adminReferences(instance, accounts, tasks, true);
+                    if (refs.isEmpty()) {
+                        instance.remove("hasInitialAdmin");
+                        instance.remove("hasMigratedInitialAdmin");
+                    }
+                    instance.put("canViewDataEaseAdmin", !refs.isEmpty() && adminTargetReady(instance, tasks, false));
+                    instance.put("canResetDataEaseAdmin", adminTargetReady(instance, tasks, true));
                 }
             } else if (!collection.equals("tasks")) Collections.reverse(records);
             result.put(collection, records.stream().map(record -> switch (collection) {
@@ -1040,6 +1054,8 @@ public final class OperationsService {
                         "还原所选备份内容",
                         45,
                         () -> {
+                            if (restoreReplacesAdmin(text(backup, "scope"), target))
+                                updateTask(taskId, obj("restoredAdminCredentialRefs", backupAdminReferences(backup, newestTasks(), true)));
                             updateTask(taskId, obj("dataChanged", true));
                             execution.restore(backup, target, targetCredentials, log);
                         });
@@ -1055,22 +1071,31 @@ public final class OperationsService {
                     stage(taskId, "复核已登记服务器", 2,
                             () -> verifyRegisteredDeployment(command, target, targetCredentials, installationMedia));
                 if ("install".equals(kind) && DataEaseOfflinePackage.ADAPTER.equals(installationMedia.get("adapter"))) {
-                    // DataEase password changes allow at most 20 characters.
-                    byte[] random = new byte[12];
-                    new java.security.SecureRandom().nextBytes(random);
-                    String password = "De9!" + Base64.getUrlEncoder().withoutPadding().encodeToString(random);
+                    String password = newDataEaseAdminPassword();
                     String reference = vault.put(Map.of("password", password));
                     target.put("initialAdminCredentialRef", reference);
                     setInstance(target, obj("initialAdminCredentialRef", reference));
                     targetCredentials.put("initialAdminPassword", password);
                 }
                 if (kind.equals("upgrade")) {
-                    stage(taskId, "复核升级磁盘空间", 5, () -> {
-                        var actual = execution.inspect(source, sourceCredentials);
-                        execution.validateRestoreTarget(source, actual);
-                        if (ComposeManager.isVendorEnterprise(source))
+                    if (!text(command, "vendorRollbackPackageId").isBlank()
+                            && DataEaseOfflinePackage.supportsV2ComponentUpgrade(
+                                    store.get("packages", required(command, "vendorRollbackPackageId")), installationMedia))
+                        updateTask(taskId, obj("v2ComponentUpgrade", true));
+                    beginStage(taskId, UPGRADE_TARGET_RECHECK, 2);
+                    var actual = execution.inspect(source, sourceCredentials);
+                    execution.validateRestoreTarget(source, actual);
+                    updateCurrentStage(taskId, "已核对实际实例和元数据库身份。", true);
+                    if (ComposeManager.isVendorEnterprise(source)) {
+                        beginStage(taskId, UPGRADE_PLUGINS_RECHECK, 3);
+                        String pluginCheck = execution.validateVendorUpgradePlugins(
+                                actual.instance(), actual.credentials(), text(installationMedia, "version"));
+                        updateCurrentStage(taskId, pluginCheck, true);
+                        stage(taskId, UPGRADE_ROLLBACK_RECHECK, 4, "已复核原厂部署和回退离线包。", () ->
                             execution.validateVendorRelease(store.get("packages", required(command, "vendorRollbackPackageId")),
-                                    installationMedia, actual.instance(), actual.credentials(), false);
+                                    installationMedia, actual.instance(), actual.credentials(), false));
+                    }
+                    stage(taskId, UPGRADE_SPACE_RECHECK, 5, () -> {
                         String capacity = execution.validateUpgradeSpace(installationMedia, actual.instance(), actual.credentials());
                         updateCurrentStage(taskId, capacity, false);
                         log.accept(capacity);
@@ -1087,6 +1112,7 @@ public final class OperationsService {
                                     Map<String, Object> backup = saveBackup(
                                             execution.protectionBackup(source, sourceCredentials, log),
                                             source, "升级保护备份", taskId);
+                                    execution.verifyBackup(backup);
                                     updateTask(taskId, obj("targetBackupId", backup.get("id")));
                                 } catch (Exception failure) {
                                     if (!uncertainCompletion(failure)) try {
@@ -1279,7 +1305,28 @@ public final class OperationsService {
             boolean interrupted = Thread.interrupted() || hasInterruptCause(failure);
             try {
                 String sourceRecovery = "";
-                boolean changed = bool(store.get("tasks", taskId), "dataChanged");
+                var failedTask = store.get("tasks", taskId);
+                boolean changed = bool(failedTask, "dataChanged");
+                boolean upgradeRecovered = false;
+                boolean uncertain = uncertainCompletion(failure);
+                String failureDetail = safeError(failure, command);
+                if (!uncertain) {
+                    markStageFailed(taskId, failureDetail);
+                    updateTask(taskId, obj("failureStage", text(failedTask, "currentStage")));
+                }
+                if (changed && bool(failedTask, "v2ComponentUpgrade") && !uncertain) {
+                    beginStage(taskId, "回退旧版应用、MySQL 和整体备份", 95);
+                    try {
+                        recoverV2ComponentUpgrade(failedTask, line -> appendLog(taskId, line));
+                        updateCurrentStage(taskId, "已核验旧版环境，并保持隔离。", true);
+                        upgradeRecovered = true;
+                    } catch (Exception recoveryFailure) {
+                        failure.addSuppressed(recoveryFailure);
+                        interrupted |= hasInterruptCause(recoveryFailure);
+                        markStageFailed(taskId, safeError(recoveryFailure, command));
+                        appendLog(taskId, "自动回退未完成：" + safeError(recoveryFailure, command));
+                    }
+                }
                 boolean targetRestored = false;
                 if (sourceRunningBeforeMigration != null && !sourceRunningBeforeMigration.isEmpty()
                         && !uncertainCompletion(failure)) {
@@ -1331,13 +1378,14 @@ public final class OperationsService {
                         latest.put("state", "failed");
                         latest.put("status", "失败");
                         latest.put("endedAt", now());
-                        latest.put("failureStage", text(latest, "currentStage"));
+                        if (text(latest, "failureStage").isBlank()) latest.put("failureStage", text(latest, "currentStage"));
                         latest.put("duration", duration(latest));
                         String reason = safeError(failure, command);
                         latest.put(
                                 "error",
                                 reason
-                                        + (kind.equals("install")
+                                        + (upgradeRecovered ? " 已回退到升级前的版本和数据，实例处于隔离运行。"
+                                                : kind.equals("install")
                                                 ? " 请按任务日志核对本次新建的容器和目录。清理遗留部署后可对同一目标重新预检查。"
                                                 : kind.equals("uninstall")
                                                 ? " 请核对目标机容器和归档状态，实例登记已保留。"
@@ -1360,19 +1408,12 @@ public final class OperationsService {
                                                 : bool(latest, "dataChanged")
                                                 ? " 目标可能已部分写入，请使用本任务目标保护备份恢复。若应用版本发生变化，请先核对并更新连接识别。"
                                                 : " 已在目标写入前中止，请核对应用状态后重新预检查。"));
-                        List<Map<String, Object>> stages = maps(latest.get("stages"));
-                        for (Map<String, Object> stage : stages)
-                            if (text(stage, "title").equals(text(latest, "currentStage"))) {
-                                stage.put("status", "failed");
-                                stage.put("detail", reason);
-                                stage.put("endedAt", now());
-                            }
-                        latest.put("stages", stages);
+                        markStageFailed(latest, reason);
                         var registration = map(command, "registeredHostSnapshot");
                         if (!registration.isEmpty() && !bool(latest, "dataChanged") && !bool(latest, "deploymentStarted")) {
                             store.saveInstanceAndTask(registration, latest);
                         } else {
-                            var affected = MUTATIONS.contains(kind) && !kind.equals("automation") && !targetRestored
+                            var affected = MUTATIONS.contains(kind) && !kind.equals("automation") && !targetRestored && !upgradeRecovered
                                     && !bool(latest, "upgradeServiceRecovered")
                                     && !upgradeReadOnlyStage(latest)
                                     ? store.find("instances", text(latest, "targetId")) : Optional.<Map<String, Object>>empty();
@@ -1402,6 +1443,31 @@ public final class OperationsService {
         var backup = saveBackup(migrationBackup(instance, credentials, sameHost, log), instance,
                 source ? "迁移源端保护备份" : "迁移目标保护备份", taskId);
         updateTask(taskId, obj(source ? "sourceBackupId" : "targetBackupId", backup.get("id")));
+    }
+
+    private void recoverV2ComponentUpgrade(Map<String, Object> task, Consumer<String> log) throws Exception {
+        var command = map(task, "command");
+        var original = map(task, "instanceSnapshot");
+        var backup = store.get("backups", required(task, "targetBackupId"));
+        if (!text(task, "id").equals(text(backup, "taskId"))
+                || !text(original, "id").equals(text(backup, "instanceId"))
+                || !"整体备份".equals(text(backup, "scope")))
+            throw conflict("整体备份与原升级任务不一致。");
+        var restored = execution.recoverV2ComponentUpgrade(
+                store.get("packages", required(command, "vendorRollbackPackageId")),
+                store.get("packages", required(command, "packageId")), backup, original, secrets(original), log);
+        synchronized (this) {
+            var latest = store.get("tasks", text(task, "id"));
+            var current = store.get("instances", text(original, "id"));
+            var record = new LinkedHashMap<>(original);
+            record.putAll(cleanConfig(restored));
+            long revision = number(current, "revision") + 1;
+            record.putAll(obj("status", "隔离运行", "accessMode", "isolated", "automation", pausedAutomation(),
+                    "automationCheckedAt", "", "recoveryRequired", false, "revision", revision));
+            record.put("connectionProfile", profile(record, revision));
+            latest.put("upgradeRecovered", true);
+            store.saveInstanceAndTask(record, latest);
+        }
     }
 
     private List<Map<String, Object>> checks(Map<String, Object> command) throws Exception {
@@ -1749,33 +1815,7 @@ public final class OperationsService {
         }
         if ((kind.equals("install") && verifiedInstall != null) || kind.equals("upgrade")
                 || (kind.equals("restore") && text(command, "targetId").isBlank())) {
-            checks.start("离线包与目标配置");
-            try {
-                Map<String, Object> pkg = store.get("packages", required(command, "packageId"));
-                validatePackage(pkg, target, kind, source, command, verifiedInstall);
-                if (kind.equals("upgrade") && ComposeManager.isVendorEnterprise(target)) {
-                    var candidates = store.list("packages").stream().filter(item -> "已校验".equals(text(item, "status"))
-                            && "enterprise".equals(text(item, "edition")) && text(item, "version").equals(text(target, "version"))
-                            && text(item, "arch").equals(text(target, "arch"))).toList();
-                    if (candidates.size() != 1) throw bad("请在软件包库保留唯一一份与当前实例版本、架构匹配的企业版完整离线包，用于回退。");
-                    var rollback = candidates.get(0);
-                    execution.validateVendorRelease(rollback, pkg, target, targetCredentials(command, target), false);
-                    command.put("vendorRollbackPackageId", rollback.get("id"));
-                }
-                checks.add(
-                        check("离线包与目标配置", text(pkg, "version") + " · " + text(pkg, "arch"), true));
-                if (kind.equals("upgrade")) {
-                    checks.start("升级磁盘空间");
-                    try {
-                        checks.add(check("升级磁盘空间",
-                                execution.validateUpgradeSpace(pkg, target, targetCredentials(command, target)), true));
-                    } catch (Exception error) {
-                        checks.add(check("升级磁盘空间", safeError(error, command), false));
-                    }
-                }
-            } catch (Exception error) {
-                checks.add(check("离线包与目标配置", safeError(error, command), false));
-            }
+            checkDeploymentMedia(checks, kind, source, target, command, verifiedInstall);
         }
         if (kind.equals("restore")) {
             checks.start("恢复点与目标兼容性");
@@ -1894,6 +1934,66 @@ public final class OperationsService {
         return checks.results;
     }
 
+    private void checkDeploymentMedia(PrecheckChecks checks, String kind, Map<String, Object> source,
+            Map<String, Object> target, Map<String, Object> command, Map<String, Object> verifiedInstall) {
+        String mediaCheck = "离线包与目标配置";
+        checks.start(mediaCheck);
+        Map<String, Object> pkg;
+        try {
+            pkg = store.get("packages", required(command, "packageId"));
+            validatePackage(pkg, target, kind, source, command, verifiedInstall);
+            checks.add(check(mediaCheck, text(pkg, "version") + " · " + text(pkg, "arch"), true));
+        } catch (Exception error) {
+            checks.add(check(mediaCheck, safeError(error, command), false));
+            return;
+        }
+        if (!kind.equals("upgrade")) return;
+        if (ComposeManager.isVendorEnterprise(target) && !checkVendorUpgrade(checks, pkg, target, command)) return;
+        String spaceCheck = "升级磁盘空间";
+        checks.start(spaceCheck);
+        try {
+            checks.add(check(spaceCheck, execution.validateUpgradeSpace(pkg, target, targetCredentials(command, target)), true));
+        } catch (Exception error) {
+            checks.add(check(spaceCheck, safeError(error, command), false));
+        }
+    }
+
+    private boolean checkVendorUpgrade(PrecheckChecks checks, Map<String, Object> pkg,
+            Map<String, Object> target, Map<String, Object> command) {
+        String pluginCheck = "企业版插件兼容性";
+        checks.start(pluginCheck);
+        try {
+            String detail = execution.validateVendorUpgradePlugins(
+                    target, targetCredentials(command, target), text(pkg, "version"));
+            checks.add(check(pluginCheck, detail, true));
+        } catch (Exception error) {
+            checks.add(check(pluginCheck, safeError(error, command), false));
+            return false;
+        }
+        String rollbackCheck = "原厂部署与回退条件";
+        checks.start(rollbackCheck);
+        try {
+            String current = text(target, "version"), arch = text(target, "arch");
+            var candidates = store.list("packages").stream()
+                    .filter(item -> "已校验".equals(text(item, "status")) && "enterprise".equals(text(item, "edition"))
+                            && current.equals(text(item, "version")) && arch.equals(text(item, "arch"))).toList();
+            String description = current + " · " + arch + " 企业版完整离线包";
+            if (candidates.isEmpty())
+                throw bad("缺少用于回退的 " + description + "。请在软件包管理中上传并校验当前版本的离线包。");
+            if (candidates.size() > 1)
+                throw bad("软件包库中有 " + candidates.size() + " 份 " + description
+                        + "。请保留与当前部署匹配的一份用于回退。");
+            var rollback = candidates.get(0);
+            execution.validateVendorRelease(rollback, pkg, target, targetCredentials(command, target), false);
+            command.put("vendorRollbackPackageId", rollback.get("id"));
+            checks.add(check(rollbackCheck, "已核对原厂部署和回退离线包 " + description + "。", true));
+            return true;
+        } catch (Exception error) {
+            checks.add(check(rollbackCheck, safeError(error, command), false));
+            return false;
+        }
+    }
+
     private void validatePackage(
             Map<String, Object> pkg,
             Map<String, Object> target,
@@ -1947,13 +2047,23 @@ public final class OperationsService {
                             "minimumSourceVersion",
                             "minSourceVersion",
                             "minimumUpgradeVersion"))
-                if (!text(pkg, key).isBlank()) {
-                    minimum = text(pkg, key);
-                    break;
-                }
-            if (minimum.isBlank()) throw bad("离线包未声明最低升级来源版本，请补充经过验证的兼容清单。");
-            if (compareVersion(text(source, "version"), minimum) < 0)
-                throw bad("当前实例版本低于离线包声明的最低升级来源版本。");
+                    if (!text(verified, key).isBlank()) {
+                        minimum = text(verified, key);
+                        break;
+                    }
+            if (minimum.isBlank() && !DataEaseOfflinePackage.supportsAutomaticUpgradeChecks(verified))
+                throw bad("此介质需要由提供方在兼容清单中声明最低升级来源版本。");
+            if (!minimum.isBlank() && compareVersion(text(source, "version"), minimum) < 0)
+                throw bad("当前实例 " + text(source, "version") + " 低于升级包支持的最低来源版本 " + minimum + "。");
+            if (DataEaseOfflinePackage.ADAPTER.equals(verified.get("adapter"))) {
+                String currentImage = text(source, "databaseImage");
+                String nextImage = text(map(map(verified, "images"), "database"), "reference");
+                if (!currentImage.isBlank() && !nextImage.isBlank() && !currentImage.equals(nextImage)
+                        && !(ComposeManager.isVendorEnterprise(target)
+                            && DataEaseOfflinePackage.supportsV2ComponentUpgrade(text(source, "version"), verified)))
+                    throw bad("本次升级需更换内置 MySQL 镜像（" + currentImage + " → " + nextImage
+                            + "），请使用 DataEase 原厂离线升级流程。");
+            }
         } else if (!text(pkg, "version").equals(text(target, "version")))
             throw bad("所选离线包版本与目标不一致。");
         if (!strings(verified.get("purposes")).isEmpty() && !strings(verified.get("purposes")).contains(kind))
@@ -2037,6 +2147,8 @@ public final class OperationsService {
         var result = publicRecord(task);
         if (!text(task, "targetId").isBlank())
             result.put("currentTarget", target != null && !vacant(target) && currentDeployment(target, task));
+        if ("restore".equals(text(task, "kind")))
+            result.put("restoredAdminAccount", restoreReplacesAdmin(text(task, "scope"), map(task, "targetInstanceSnapshot")));
         return result;
     }
 
@@ -2108,9 +2220,13 @@ public final class OperationsService {
     private static boolean canReplaceAccounts(Map<String, Object> task) {
         return bool(task, "dataChanged") && switch (text(task, "kind")) {
             case "install", "migrate" -> true;
-            case "restore" -> !"资源备份".equals(text(task, "scope"));
+            case "restore" -> restoreReplacesAdmin(text(task, "scope"), map(task, "targetInstanceSnapshot"));
             default -> false;
         };
+    }
+
+    private static boolean restoreReplacesAdmin(String scope, Map<String, Object> target) {
+        return "整体备份".equals(scope) || "数据备份".equals(scope) && ComposeManager.isManagedEnterprise(target);
     }
 
     private static String migrationInitialAdminReference(Map<String, Object> task) {
@@ -2118,6 +2234,52 @@ public final class OperationsService {
             return "";
         var source = map(task, "instanceSnapshot");
         return bool(source, "hasInitialAdmin") ? text(source, "initialAdminCredentialRef") : "";
+    }
+
+    private List<Map<String, Object>> newestTasks() {
+        var tasks = store.list("tasks");
+        Collections.reverse(tasks);
+        return tasks;
+    }
+
+    private List<String> adminReferences(Map<String, Object> instance, Map<String, Object> change,
+            List<Map<String, Object>> tasks, boolean allowLegacyBackup) {
+        if (Objects.equals(instance.get("managedAdminCredentialBasis"), text(change, "id"))) {
+            var saved = strings(instance.get("managedAdminCredentialRefs"));
+            if (!saved.isEmpty()) return saved;
+        }
+        String kind = text(change, "kind");
+        if ("restore".equals(kind)) {
+            if (change.containsKey("restoredAdminCredentialRefs"))
+                return strings(change.get("restoredAdminCredentialRefs"));
+            return store.find("backups", text(change, "backupId"))
+                    .map(backup -> backupAdminReferences(backup, tasks, allowLegacyBackup)).orElse(List.of());
+        }
+        String reference = "migrate".equals(kind) ? migrationInitialAdminReference(change)
+                : bool(instance, "hasInitialAdmin") ? text(instance, "initialAdminCredentialRef") : "";
+        return reference.isBlank() ? List.of() : List.of(reference);
+    }
+
+    private List<String> backupAdminReferences(Map<String, Object> backup,
+            List<Map<String, Object>> tasks, boolean allowLegacy) {
+        if ("资源备份".equals(text(backup, "scope")) || !text(backup, "importedAt").isBlank()) return List.of();
+        if (backup.containsKey("localAdminCredentialRefs")) return strings(backup.get("localAdminCredentialRefs"));
+        String producer = text(backup, "taskId");
+        if (!allowLegacy || producer.isBlank()) return List.of();
+        for (int index = 0; index < tasks.size(); index++) {
+            var task = tasks.get(index);
+            if (!producer.equals(text(task, "id"))) continue;
+            for (String field : List.of("instanceSnapshot", "targetInstanceSnapshot")) {
+                var snapshot = map(task, field);
+                if (!snapshot.isEmpty() && text(backup, "instanceId").equals(text(snapshot, "id"))
+                        && text(backup, "deploymentId").equals(text(snapshot, "deploymentId"))) {
+                    var earlier = tasks.subList(index + 1, tasks.size());
+                    return adminReferences(snapshot, latestAccountChange(snapshot, earlier), earlier, false);
+                }
+            }
+            break;
+        }
+        return List.of();
     }
 
     private static boolean releaseCandidate(Map<String, Object> instance) {
@@ -2233,7 +2395,11 @@ public final class OperationsService {
         List<Map<String, Object>> results = normalizedChecks(observed)
                 .stream().map(CheckGuidance::apply).toList();
         if (passed(results)) updateCurrentStage(id, "运行核验通过。", true);
-        else markStageFailed(id, "请核对未通过的检查项。");
+        else markStageFailed(id, results.stream()
+                .filter(row -> "blocked".equals(text(row, "status")))
+                .map(OperationsService::checkDescription)
+                .filter(reason -> !reason.isBlank())
+                .findFirst().orElse("运行核验未返回通过结果。"));
         updateTask(id, obj("currentCheck", ""));
         return results;
     }
@@ -2280,11 +2446,20 @@ public final class OperationsService {
             requirePending(task);
             target = store.get("instances", text(task, "targetId"));
             if (!text(target, "name").equals(text(input, "confirmTargetName")))
-                throw bad("请输入完整目标实例名称以确认停止目标并终止验收。");
-            task.put("state", "aborting");
-            task.put("status", "终止中");
-            task.put("activityStartedAt", now());
-            store.put("tasks", id, task);
+                throw bad("请输入完整目标实例名称以确认操作。");
+            if (bool(task, "v2ComponentUpgrade")) {
+                var rollbackTask = task;
+                updateTask(id, obj("state", "aborting", "status", "执行中", "activityStartedAt", now(), "error", ""));
+                beginStage(id, UPGRADE_ROLLBACK_STAGE, 95);
+                try {
+                    executor.submit(() -> finishUpgradeRollback(id, rollbackTask, target));
+                } catch (RejectedExecutionException busy) {
+                    store.put("tasks", id, task);
+                    throw conflict("任务队列已满，请稍后重试。");
+                }
+                return publicRecord(store.get("tasks", id));
+            }
+            updateTask(id, obj("state", "aborting", "status", "终止中", "activityStartedAt", now()));
             beginStage(id, ABORT_ACCEPTANCE_STAGE, 95);
         }
         try {
@@ -2333,6 +2508,25 @@ public final class OperationsService {
                             "error",
                             "目标停服未确认，验收终止未完成；实例仍锁定，请核对容器状态后重试。"));
             throw conflict("目标停服未确认，验收终止未完成；实例仍锁定，请核对容器状态后重试。");
+        }
+    }
+
+    private void finishUpgradeRollback(String id, Map<String, Object> task, Map<String, Object> target) {
+        try {
+            recoverV2ComponentUpgrade(task, line -> appendLog(id, line));
+            updateCurrentStage(id, "已回退到升级前的版本和数据，并保持隔离。", true);
+            updateTask(id, obj("state", "failed", "status", "失败", "endedAt", now(), "duration", duration(task),
+                    "failureStage", "业务验收已终止", "error", "已终止升级验收并恢复旧版本和整体备份。"));
+        } catch (Exception failure) {
+            String reason = safeError(failure, map(task, "command"));
+            markStageFailed(id, reason);
+            if (uncertainCompletion(failure)) {
+                markReconciliationRequired(id, failure, "abort_interrupted", "回退命令结束状态待确认，请先核查现场。");
+                return;
+            }
+            setInstance(target, obj("status", "状态待确认", "accessMode", "unknown", "recoveryRequired", true));
+            updateTask(id, obj("state", "pending_acceptance", "status", "待验收",
+                    "acceptance", checkedAcceptance(task, List.of()), "error", "未完成回退。" + reason));
         }
     }
 
@@ -2509,13 +2703,7 @@ public final class OperationsService {
                 acceptance.put("releaseConfirmed", false);
                 task.put("acceptance", acceptance);
             }
-            List<Map<String, Object>> stages = maps(task.get("stages"));
-            for (Map<String, Object> stage : stages)
-                if (text(stage, "title").equals(text(task, "currentStage"))) {
-                    stage.put("status", "unknown");
-                    stage.remove("endedAt");
-                }
-            task.put("stages", stages);
+            finishStage(task, "unknown", detail + context);
             Set<String> ids = operationIds(map(task, "command"));
             for (String key : List.of("instanceId", "targetId"))
                 if (!text(task, key).isBlank()) ids.add(text(task, key));
@@ -2534,7 +2722,9 @@ public final class OperationsService {
     }
 
     private static boolean upgradeReadOnlyStage(Map<String, Object> task) {
-        return "upgrade".equals(text(task, "kind")) && "复核升级磁盘空间".equals(text(task, "currentStage"));
+        return "upgrade".equals(text(task, "kind"))
+                && Set.of(UPGRADE_TARGET_RECHECK, UPGRADE_PLUGINS_RECHECK, UPGRADE_ROLLBACK_RECHECK, UPGRADE_SPACE_RECHECK)
+                        .contains(text(task, "currentStage"));
     }
 
     private static boolean hasExecutionEvidence(Map<String, Object> task) {
@@ -2617,7 +2807,11 @@ public final class OperationsService {
         stages.removeIf(stage -> alternativeTitles.contains(text(stage, "title"))
                 && !acceptanceTitles.contains(text(stage, "title")) && "pending".equals(text(stage, "status")));
         stages.stream().filter(stage -> ACCEPTANCE_DECISION_STAGE.equals(text(stage, "title")))
-                .forEach(stage -> stage.putAll(obj("status", "passed", "endedAt", now())));
+                .filter(stage -> !"passed".equals(text(stage, "status")))
+                .forEach(stage -> {
+                    startStage(task, stage);
+                    recordStageEnd(task, stage, "passed", "");
+                });
         for (String title : acceptanceTitles)
             if (stages.stream().noneMatch(stage -> title.equals(text(stage, "title"))))
                 stages.add(obj("title", title, "status", "pending"));
@@ -2695,7 +2889,7 @@ public final class OperationsService {
             }
         } catch (Exception error) {
             String failedStage = text(store.get("tasks", id), "currentStage");
-            markStageFailed(id, standalone ? safeError(error, map(task, "command")) : "运行核验或访问切换未完成。");
+            markStageFailed(id, safeError(error, map(task, "command")));
             updateTask(id, obj("currentCheck", ""));
             if (accessChangeStarted && uncertainCompletion(error)) {
                 markReconciliationRequired(
@@ -2796,7 +2990,7 @@ public final class OperationsService {
         var existing = store.find(kind.equals("plugin") ? "plugins" : "packages", reservedId);
         if (existing.isPresent()) {
             if (!sha256.equals(text(existing.get(), "sha256"))) throw conflict("下载入库身份不一致。");
-            return publicRecord(media.verify(existing.get()));
+            return publicRecord(media.packageDisplay(media.verify(existing.get())));
         }
         return addPackage(input, kind, filename, new char[0], reservedId, sha256);
     }
@@ -2830,12 +3024,12 @@ public final class OperationsService {
                             || kind.equals("backup") && !text(record, "importSha256").isBlank()
                                 && text(previous, "importSha256").equals(text(record, "importSha256"))) {
                         media.delete(record);
-                        return publicRecord(previous);
+                        return publicRecord(media.packageDisplay(previous));
                     }
                 String id = text(record, "id").isBlank() ? id(kind) : text(record, "id");
                 record.put("id", id);
                 record.put("createdAt", now());
-                return publicRecord(store.put(collection, id, record));
+                return publicRecord(media.packageDisplay(store.put(collection, id, record)));
             }
         } catch (Exception error) {
             try {
@@ -2859,7 +3053,7 @@ public final class OperationsService {
             Map<String, Object> current = store.get(collection, id);
             if (number(current, "revision") != number(record, "revision"))
                 throw conflict("介质清单已变化，请重新校验。");
-            return publicRecord(store.put(collection, id, verified));
+            return publicRecord(media.packageDisplay(store.put(collection, id, verified)));
         }
     }
 
@@ -3203,6 +3397,11 @@ public final class OperationsService {
                         "drillStatus",
                         "未演练"));
         Map<String, Object> task = store.get("tasks", taskId);
+        if (!"资源备份".equals(text(backup, "scope"))) {
+            var tasks = newestTasks();
+            backup.put("localAdminCredentialRefs",
+                    adminReferences(instance, latestAccountChange(instance, tasks), tasks, true));
+        }
         String planId = text(map(task, "command"), "planId");
         if (!planId.isBlank()) backup.put("planId", planId);
         return store.put("backups", id, backup);
@@ -3249,6 +3448,8 @@ public final class OperationsService {
         updateTask(taskId, obj("targetInstanceSnapshot", target, "version", target.get("version")));
         updateCurrentStage(taskId, "已复核安装版本和目标身份。", true);
         var checks = runAcceptanceChecks(taskId, target, AUTOMATED_ACCEPTANCE_STAGE, 95);
+        if (bool(task, "v2ComponentUpgrade") && !passed(checks))
+            throw conflict("升级后的运行核验未通过。");
         updateTask(taskId, obj("state", "pending_acceptance", "status", "待验收", "progress", 100,
                 "executionEndedAt", now(), "duration", duration(store.get("tasks", taskId)), "liveChecks", List.of(),
                 "acceptance", checkedAcceptance(obj("acceptance",
@@ -3297,12 +3498,18 @@ public final class OperationsService {
         store.put("tasks", id, task);
     }
 
-    private void appendLog(Map<String, Object> task, String cleaned) {
+    private long appendLog(Map<String, Object> task, String cleaned) {
         List<String> logs = new ArrayList<>(strings(task.get("logs")));
+        long offset = number(task, "logOffset");
+        long position = offset + logs.size();
         logs.add("[" + now() + "] " + cleaned);
-        if (logs.size() > 5000)
-            logs = new ArrayList<>(logs.subList(logs.size() - 5000, logs.size()));
+        if (logs.size() > 5000) {
+            int trimmed = logs.size() - 5000;
+            logs = new ArrayList<>(logs.subList(trimmed, logs.size()));
+            task.put("logOffset", offset + trimmed);
+        }
         task.put("logs", logs);
+        return position;
     }
 
     private void stage(String id, String name, int progress, CheckedAction action)
@@ -3359,6 +3566,20 @@ public final class OperationsService {
                     var results = new ArrayList<>(maps(task.get("liveChecks")));
                     results.add(check);
                     task.put("liveChecks", results);
+                    var stages = maps(task.get("stages"));
+                    String current = text(task, "currentStage");
+                    stages.stream().filter(stage -> current.equals(text(stage, "title"))).findFirst()
+                            .ifPresent(stage -> stage.put("checkResultsInLog", true));
+                    task.put("stages", stages);
+                    String label = switch (normalizedCheckStatus(check)) {
+                        case "passed" -> "通过";
+                        case "warning" -> "关注";
+                        default -> "阻断";
+                    };
+                    String hint = text(map(CheckGuidance.apply(check), "remediation"), "hint");
+                    String line = "检查" + label + " · " + checkDescription(check);
+                    if (!hint.isBlank() && !hint.equals(text(check, "detail"))) line += "\n" + hint;
+                    appendLog(task, redact(line, map(task, "command")));
                     task.put("currentCheck", "");
                     task.remove("currentCheckStartedAt");
                     store.put("tasks", id, task);
@@ -3374,11 +3595,40 @@ public final class OperationsService {
     }
 
     private void markStageFailed(Map<String, Object> task, String detail) {
+        finishStage(task, "failed", detail);
+    }
+
+    private void finishStage(Map<String, Object> task, String status, String detail) {
         var stages = maps(task.get("stages"));
-        for (var stage : stages)
-            if (text(stage, "title").equals(text(task, "currentStage")))
-                stage.putAll(obj("status", "failed", "detail", detail, "endedAt", now()));
+        String title = text(task, "currentStage");
+        var stage = stages.stream().filter(item -> title.equals(text(item, "title"))).findFirst().orElse(null);
+        if (stage == null || (!"running".equals(text(stage, "status"))
+                && !("unknown".equals(status) && "failed".equals(text(stage, "status"))))) return;
+        recordStageEnd(task, stage, status, detail);
         task.put("stages", stages);
+    }
+
+    private void recordStageEnd(Map<String, Object> task, Map<String, Object> stage, String status, String detail) {
+        String clean = redact(detail, map(task, "command"));
+        stage.putAll(obj("status", status, "endedAt", now()));
+        if (!clean.isBlank()) stage.put("detail", clean);
+        String label = switch (status) {
+            case "passed" -> "完成";
+            case "failed" -> "失败";
+            default -> "状态待确认";
+        };
+        appendLog(task, "── " + label + " · " + text(stage, "title") + " ──"
+                + (clean.isBlank() ? "" : "\n" + clean));
+        task.remove("stageActivity");
+    }
+
+    private void startStage(Map<String, Object> task, Map<String, Object> stage) {
+        stage.put("status", "running");
+        stage.put("startedAt", now());
+        stage.remove("endedAt");
+        stage.remove("detail");
+        stage.remove("checkResultsInLog");
+        stage.put("logStart", appendLog(task, "── 开始 · " + text(stage, "title") + " ──"));
     }
 
     private void beginStage(String id, String name, int progress) {
@@ -3394,17 +3644,13 @@ public final class OperationsService {
                 current = obj("title", name);
                 stages.add(current);
             }
-            current.put("status", "running");
-            current.put("startedAt", now());
-            current.remove("endedAt");
-            current.remove("detail");
+            startStage(task, current);
             task.put("stages", stages);
             task.put("currentStage", name);
             task.remove("stageActivity");
             task.remove("currentCheckStartedAt");
             task.put("currentCheck", "");
             task.put("progress", progress);
-            appendLog(task, name);
             store.put("tasks", id, task);
         }
     }
@@ -3412,16 +3658,16 @@ public final class OperationsService {
     private void updateCurrentStage(String id, String result, boolean completed) {
         synchronized (this) {
             Map<String, Object> task = store.get("tasks", id);
+            if (completed) {
+                finishStage(task, "passed", result);
+                store.put("tasks", id, task);
+                return;
+            }
             String name = text(task, "currentStage");
             List<Map<String, Object>> stages = maps(task.get("stages"));
             for (Map<String, Object> item : stages)
                 if (name.equals(text(item, "title"))) {
                     if (!result.isBlank()) item.put("detail", result);
-                    if (completed) {
-                        item.put("status", "passed");
-                        item.put("endedAt", now());
-                        task.remove("stageActivity");
-                    }
                 }
             task.put("stages", stages);
             store.put("tasks", id, task);
@@ -3468,7 +3714,12 @@ public final class OperationsService {
                 boolean upgrade = "upgrade".equals(kind);
                 boolean offlineCompose = DataEaseOfflinePackage.ADAPTER.equals(
                         store.get("packages", required(command, "packageId")).get("adapter"));
-                if (upgrade) titles.addAll(List.of("复核升级磁盘空间", "停服并建立升级保护备份"));
+                if (upgrade) {
+                    titles.add(UPGRADE_TARGET_RECHECK);
+                    if (!text(command, "vendorRollbackPackageId").isBlank())
+                        titles.addAll(List.of(UPGRADE_PLUGINS_RECHECK, UPGRADE_ROLLBACK_RECHECK));
+                    titles.addAll(List.of(UPGRADE_SPACE_RECHECK, "停服并建立升级保护备份"));
+                }
                 if (!text(command, "vacantTargetId").isBlank()) titles.add("复核已登记服务器");
                 titles.addAll(ExecutionService.installStageTitles(offlineCompose, upgrade));
                 titles.add("隔离启动并核对环境");
@@ -3724,52 +3975,129 @@ public final class OperationsService {
         return ref.isBlank() ? Map.of() : vault.get(ref);
     }
 
-    public Map<String, String> initialAdmin(String id) throws Exception {
-        Map<String, Object> instance;
-        String reference;
-        synchronized (this) {
-            instance = store.get("instances", id);
-            if (vacant(instance)) throw OperationsApiException.notFound("该实例尚未安装 DataEase。");
-            var tasks = store.list("tasks");
-            Collections.reverse(tasks);
-            var accounts = latestAccountChange(instance, tasks);
-            if ("restore".equals(text(accounts, "kind")))
-                throw OperationsApiException.notFound("该实例的账号数据已还原，请使用备份对应的密码。");
-            if (!"migrate".equals(text(accounts, "kind"))) {
-                reference = text(instance, "initialAdminCredentialRef");
-                if (bool(instance, "hasInitialAdmin") && !reference.isBlank())
-                    return Map.of("username", "admin", "password", vault.get(reference).get("password"));
-                throw OperationsApiException.notFound("该实例没有保存安装初始密码。");
+    private static String newDataEaseAdminPassword() {
+        byte[] random = new byte[12];
+        new java.security.SecureRandom().nextBytes(random);
+        return "De9!" + Base64.getUrlEncoder().withoutPadding().encodeToString(random);
+    }
+
+    private static boolean accountOperationSupported(Map<String, Object> instance) {
+        return !vacant(instance) && "MySQL".equals(text(instance, "dbType"))
+                && !text(instance, "databaseService").isBlank()
+                && !text(instance, "hostIdentity").isBlank() && !text(instance, "databaseIdentity").isBlank()
+                && text(instance, "version").matches("v?[23]\\.\\d+\\.\\d+");
+    }
+
+    private static List<Map<String, Object>> activeInstanceTasks(String id, List<Map<String, Object>> tasks) {
+        return tasks.stream().filter(task -> ACTIVE.contains(text(task, "state"))
+                && (id.equals(text(task, "targetId")) || id.equals(text(task, "instanceId")))).toList();
+    }
+
+    private boolean adminTargetReady(Map<String, Object> instance, List<Map<String, Object>> tasks, boolean reset) {
+        String id = text(instance, "id");
+        if (adminOperations.contains(id) || !accountOperationSupported(instance) || bool(instance, "recoveryRequired")
+                || reset && !ComposeManager.isManagedEnterprise(instance)) return false;
+        var activeTasks = activeInstanceTasks(id, tasks);
+        if (activeTasks.isEmpty()) return Set.of("运行中", "隔离运行").contains(text(instance, "status"));
+        var task = activeTasks.get(0);
+        return activeTasks.size() == 1 && "pending_acceptance".equals(text(task, "state"))
+                && id.equals(text(task, "targetId")) && currentDeployment(instance, task)
+                && "isolated".equals(text(instance, "accessMode"))
+                && ("restore".equals(text(task, "kind")) || !reset && "install".equals(text(task, "kind")));
+    }
+
+    private record AdminOperation(Map<String, Object> instance, String basis, List<String> references,
+                                  String pendingTaskId) {
+        boolean isolated() { return "isolated".equals(text(instance, "accessMode")); }
+    }
+
+    private synchronized AdminOperation reserveAdminOperation(String id, boolean reset, Map<String, Object> input) {
+        var instance = store.get("instances", id);
+        var tasks = newestTasks();
+        if (reset && (!text(instance, "name").equals(required(input, "confirmTargetName"))
+                || !input.containsKey("instanceRevision")
+                || number(instance, "revision") != number(input, "instanceRevision")))
+            throw conflict("实例配置已变化，请重新打开并确认目标。");
+        if (!adminTargetReady(instance, tasks, reset))
+            throw conflict("请确认实例和受管 MySQL 已运行、连接可核验，且没有其他操作正在执行。");
+        var pending = activeInstanceTasks(id, tasks);
+        String pendingTaskId = pending.isEmpty() ? "" : text(pending.get(0), "id");
+        if (!text(input, "acceptanceTaskId").isBlank() && !pendingTaskId.equals(text(input, "acceptanceTaskId")))
+            throw conflict("还原任务状态已变化，请重新打开实例。");
+        var change = latestAccountChange(instance, tasks);
+        var refs = adminReferences(instance, change, tasks, true);
+        adminOperations.add(id);
+        return new AdminOperation(instance, text(change, "id"), refs, pendingTaskId);
+    }
+
+    private Map<String, String> savedAdminCandidates(List<String> refs) {
+        var candidates = new LinkedHashMap<String, String>();
+        for (String ref : refs) {
+            try {
+                String password = vault.get(ref).get("password");
+                if (password != null && !password.isBlank()) candidates.put(ref, password);
+            } catch (OperationsApiException missing) {
+                // A backup may refer to a previously removed local credential.
             }
-            requireUnlocked(id);
-            reference = migrationInitialAdminReference(accounts);
-            if (reference.isBlank())
-                throw OperationsApiException.notFound("该实例没有可核验的初始密码。");
         }
-        String password = vault.get(reference).get("password");
-        if (password == null || password.isBlank())
-            throw OperationsApiException.notFound("原 V2 实例没有保存初始密码。");
+        return candidates;
+    }
+
+    public Map<String, String> initialAdmin(String id) {
+        var operation = reserveAdminOperation(id, false, Map.of());
         try {
-            var credentials = secrets(instance);
-            execution.validateMigrationIdentity(instance, execution.inspect(instance, credentials));
-            execution.verifyAdminLogin(instance, credentials, password);
-        } catch (Exception unavailable) {
-            if (hasInterruptCause(unavailable)) Thread.currentThread().interrupt();
-            throw conflict("无法验证原 V2 初始密码可登录 V3。请确认 V3 正常运行，或使用后来设置的密码。");
+            var candidates = savedAdminCandidates(operation.references());
+            if (candidates.isEmpty())
+                throw OperationsApiException.notFound("运维中心没有保存此实例可核验的密码。请使用原密码，或重置 DataEase 管理员密码。");
+            try {
+                String reference = execution.verifySavedAdminLogin(operation.instance(), secrets(operation.instance()),
+                        candidates, operation.isolated());
+                return Map.of("username", "admin", "password", candidates.get(reference));
+            } catch (Exception unverifiable) {
+                if (hasInterruptCause(unverifiable)) Thread.currentThread().interrupt();
+                throw conflict("未能核实已保存的密码可登录 DataEase。请确认应用正常运行，或重置管理员密码。");
+            }
+        } finally {
+            adminOperations.remove(id);
         }
-        synchronized (this) {
-            requireUnlocked(id);
-            if (!store.get("instances", id).equals(instance))
-                throw conflict("实例配置已变化，请重新验证。");
-            var tasks = store.list("tasks");
-            Collections.reverse(tasks);
-            if (!reference.equals(migrationInitialAdminReference(latestAccountChange(instance, tasks))))
-                throw conflict("实例账号来源已变化，请重新验证。");
+    }
+
+    public Map<String, String> resetDataEaseAdmin(String id, Map<String, Object> input) {
+        var operation = reserveAdminOperation(id, true, input);
+        String password = newDataEaseAdminPassword();
+        try {
+            var candidates = savedAdminCandidates(operation.references());
+            execution.resetInstanceAdmin(operation.instance(), secrets(operation.instance()), candidates, password,
+                    operation.isolated(), previous -> {
+                        // Persist both the replacement and any known previous credential before attempting the write.
+                        String ref = vault.put(Map.of("password", password));
+                        var saved = store.get("instances", id);
+                        saved.put("managedAdminCredentialBasis", operation.basis());
+                        saved.put("managedAdminCredentialRefs", previous.isBlank() ? List.of(ref) : List.of(ref, previous));
+                        store.put("instances", id, saved);
+                    });
+            var saved = store.get("instances", id);
+            saved.put("managedAdminCredentialRefs", List.of(strings(saved.get("managedAdminCredentialRefs")).get(0)));
+            saved.put("lastAdminResetAt", now());
+            if (operation.pendingTaskId().isBlank()) store.put("instances", id, saved);
+            else {
+                var task = store.get("tasks", operation.pendingTaskId());
+                appendLog(task, "已重置 DataEase 管理员密码，登录核验通过。");
+                store.saveInstanceAndTask(saved, task);
+            }
+            return Map.of("username", "admin", "password", password);
+        } catch (OperationsApiException failure) {
+            throw failure;
+        } catch (Exception failure) {
+            if (hasInterruptCause(failure)) Thread.currentThread().interrupt();
+            throw conflict("未能完成管理员密码重置。请核对实例连接和运行状态，再尝试查看已验证的密码。");
+        } finally {
+            adminOperations.remove(id);
         }
-        return Map.of("username", "admin", "password", password);
     }
 
     public synchronized Map<String, Object> uninstall(String id) {
+        if (adminOperations.contains(id)) throw conflict("该实例正在验证管理员账号，请稍后重试。");
         Map<String, Object> instance = store.get("instances", id);
         if (!ComposeManager.isVendorEnterprise(instance))
             throw bad("当前支持卸载由运维中心部署的企业版单机实例。");
@@ -3805,12 +4133,12 @@ public final class OperationsService {
                     && Set.of("install", "upgrade", "migrate", "restore", "plugin")
                             .contains(text(task, "kind"))
                     && bool(task, "dataChanged"))
-                return "failed".equals(text(task, "state"));
+                return "failed".equals(text(task, "state")) && !bool(task, "upgradeRecovered");
         return false;
     }
 
     private boolean isLocked(String id) {
-        return store.list("tasks").stream()
+        return adminOperations.contains(id) || store.list("tasks").stream()
                 .anyMatch(
                         task ->
                                 (ACTIVE.contains(text(task, "state"))
@@ -3934,6 +4262,7 @@ public final class OperationsService {
                         "tag",
                         "isolationSupported",
                         "databaseService",
+                        "databaseImage",
                         "composeProject",
                         "composeFiles",
                         "serviceCount",
@@ -4146,6 +4475,8 @@ public final class OperationsService {
 
     private void requirePending(Map<String, Object> task) {
         if (!"pending_acceptance".equals(text(task, "state"))) throw conflict("该任务当前不处于待验收状态。");
+        if (adminOperations.contains(text(task, "targetId")))
+            throw conflict("目标实例正在验证管理员账号，请稍后继续验收。");
         if (store.list("tasks").stream().anyMatch(item -> "uninstall".equals(text(item, "kind"))
                 && ACTIVE.contains(text(item, "state")) && text(task, "targetId").equals(text(item, "targetId"))))
             throw conflict("该实例正在处理卸载任务。");
@@ -4158,8 +4489,8 @@ public final class OperationsService {
     private String safeError(Exception error, Map<String, Object> command) {
         String result = error.getMessage();
         if (result == null || result.isBlank()) result = "执行失败，请检查服务端日志和连接状态。";
-        return redact(result, command)
-                .substring(0, Math.min(redact(result, command).length(), 1500));
+        String cleaned = redact(result, command);
+        return cleaned.substring(0, Math.min(cleaned.length(), 1500));
     }
 
     private String redact(String line, Map<String, Object> command) {
@@ -4274,17 +4605,25 @@ public final class OperationsService {
         List<Map<String, Object>> result = new ArrayList<>();
         for (Map<String, Object> row : rows) {
             Map<String, Object> copy = new LinkedHashMap<>(row);
-            String status = text(copy, "status");
-            copy.put(
-                    "status",
-                    Set.of("passed", "通过", "正常").contains(status)
-                            ? "passed"
-                            : Set.of("warning", "注意", "关注").contains(status)
-                                    ? "warning"
-                                    : "blocked");
+            copy.put("status", normalizedCheckStatus(row));
             result.add(copy);
         }
         return result;
+    }
+
+    private static String normalizedCheckStatus(Map<String, Object> check) {
+        return switch (text(check, "status")) {
+            case "passed", "通过", "正常" -> "passed";
+            case "warning", "注意", "关注" -> "warning";
+            default -> "blocked";
+        };
+    }
+
+    private static String checkDescription(Map<String, Object> check) {
+        String title = text(check, "title");
+        if (title.isBlank()) title = text(check, "name");
+        String detail = text(check, "detail");
+        return title.isBlank() ? detail : detail.isBlank() ? title : title + " · " + detail;
     }
 
     private static String firstBlocked(List<Map<String, Object>> rows) {
